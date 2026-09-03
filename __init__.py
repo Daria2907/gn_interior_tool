@@ -1408,23 +1408,19 @@ def _refresh_thresholds(context):
         if not op.is_door:
             continue
         n = Vector((op.nx, op.ny, 0.0)).normalized()   # points into the room it was placed in
-        if s.threshold_flip:
-            n = -n
         along = Vector((-n.y, n.x, 0.0))
         up = Vector((0.0, 0.0, 1.0))
         hw = op.hw
-        gap = max(s.partition, 0.0)                     # distance across the doorway to the next room
-        lip = max(s.threshold_depth, 0.0)               # extra reach into this room past the gap
-        depth = gap + lip
+        gap = max(s.partition, 0.0)                     # distance across the doorway
+        lip = max(s.threshold_depth, 0.0)               # extra reach into each room
+        half = gap * 0.5 + lip
         h = max(s.threshold_height, 1e-4)
-        # ORIGIN starts on the FAR edge (next room's wall) + the user Offset nudge;
-        # the strip spans +Y across the gap and a lip into this room.
-        off = s.threshold_offset
-        ox = op.cx - n.x * gap + n.x * off
-        oy = op.cy - n.y * gap + n.y * off
+        # ORIGIN sits where the two rooms meet: the centre of the gap between them.
+        ox = op.cx - n.x * (gap * 0.5)
+        oy = op.cy - n.y * (gap * 0.5)
         bm = bmesh.new()
-        vlo = [bm.verts.new((-hw, 0.0, 0.0)), bm.verts.new((hw, 0.0, 0.0)),
-               bm.verts.new((hw, depth, 0.0)), bm.verts.new((-hw, depth, 0.0))]
+        vlo = [bm.verts.new((-hw, -half, 0.0)), bm.verts.new((hw, -half, 0.0)),
+               bm.verts.new((hw, half, 0.0)), bm.verts.new((-hw, half, 0.0))]
         vhi = [bm.verts.new((v.co.x, v.co.y, h)) for v in vlo]
         bm.faces.new(vlo)
         bm.faces.new(vhi[::-1])
@@ -1807,9 +1803,6 @@ class GN_PT_doors(_PanelBase, Panel):
             r = layout.row(align=True)
             r.prop(s, "threshold_height", text="H")
             r.prop(s, "threshold_depth", text="D")
-            r = layout.row(align=True)
-            r.prop(s, "threshold_offset")
-            r.prop(s, "threshold_flip", toggle=True)
 
 
 class GN_PT_windows(_PanelBase, Panel):
