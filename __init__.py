@@ -305,6 +305,7 @@ class GN_IntProps(PropertyGroup):
 # ===========================================================================
 class GN_OT_set_exterior(Operator):
     bl_idname = "gn_int.set_exterior"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Use Active as Exterior"
     bl_description = "Set the active object as the exterior shell"
 
@@ -319,6 +320,7 @@ class GN_OT_set_exterior(Operator):
 
 class GN_OT_add_floor_sel(Operator):
     bl_idname = "gn_int.add_floor_sel"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Floor from Selected Edge"
     bl_description = ("Add a floor level at the Z of the selected geometry "
                       "(select a facade edge in Edit Mode)")
@@ -352,6 +354,7 @@ class GN_OT_add_floor_sel(Operator):
 
 class GN_OT_add_floor_ground(Operator):
     bl_idname = "gn_int.add_floor_ground"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Ground Floor"
     bl_description = "Add a floor level at the base of the exterior shell"
 
@@ -370,6 +373,7 @@ class GN_OT_add_floor_ground(Operator):
 
 class GN_OT_remove_floor(Operator):
     bl_idname = "gn_int.remove_floor"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Remove Floor"
     index: IntProperty()
 
@@ -406,6 +410,7 @@ def _floor_tops(context):
 
 class GN_OT_gen_boundaries(Operator):
     bl_idname = "gn_int.gen_boundaries"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Generate Boundaries"
     bl_description = "Create a per-floor boundary outline (exterior inset by the margin)"
 
@@ -441,6 +446,7 @@ class GN_OT_gen_boundaries(Operator):
 
 class GN_OT_clear(Operator):
     bl_idname = "gn_int.clear"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clear Generated"
     bl_description = "Delete generated boundaries and interior shells"
 
@@ -817,6 +823,7 @@ def _draw_room_overlay(self, context):
 
 class GN_OT_draw_room(Operator):
     bl_idname = "gn_int.draw_room"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Draw Room"
     bl_description = ("Click two opposite corners on the active floor to create a "
                       "rectangular room (clamped to the boundary)")
@@ -887,6 +894,7 @@ class GN_OT_draw_room(Operator):
 
 class GN_OT_add_room(Operator):
     bl_idname = "gn_int.add_room"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Room (center)"
     bl_description = "Add a default room in the middle of the active floor (no drawing)"
 
@@ -913,6 +921,7 @@ class GN_OT_add_room(Operator):
 
 class GN_OT_remove_room(Operator):
     bl_idname = "gn_int.remove_room"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Remove Room"
     index: IntProperty()
 
@@ -926,6 +935,7 @@ class GN_OT_remove_room(Operator):
 
 class GN_OT_rebuild_rooms(Operator):
     bl_idname = "gn_int.rebuild_rooms"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Rebuild Rooms"
     bl_description = "Rebuild all room shells from stored footprints"
 
@@ -936,6 +946,7 @@ class GN_OT_rebuild_rooms(Operator):
 
 class GN_OT_clear_rooms(Operator):
     bl_idname = "gn_int.clear_rooms"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clear Rooms"
 
     def execute(self, context):
@@ -946,6 +957,7 @@ class GN_OT_clear_rooms(Operator):
 
 class GN_OT_seed_rooms(Operator):
     bl_idname = "gn_int.seed_rooms"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Rooms = Envelope"
     bl_description = ("Start room-making: one room per floor = that floor's whole "
                       "envelope. Then split it into rooms")
@@ -980,6 +992,7 @@ def _draw_cut_overlay(self, context):
 
 class GN_OT_split_room(Operator):
     bl_idname = "gn_int.split_room"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Split Room"
     bl_description = ("Click two points across a room (wall to opposite wall) to "
                       "cut it into two rooms with a partition-wall gap")
@@ -1049,6 +1062,7 @@ class GN_OT_split_room(Operator):
 
 class GN_OT_split_edges(Operator):
     bl_idname = "gn_int.split_edges"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Split at Selected Edges"
     bl_description = ("Edit Mode: select two edges (one on each of two opposite "
                       "walls) of a room, then run this to cut the room between them")
@@ -1154,6 +1168,7 @@ def _piece_frame(obj):
 
 class GN_OT_project_openings(Operator):
     bl_idname = "gn_int.project_openings"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Project Openings"
     bl_description = ("Cut openings into the room walls from the selected window/door "
                       "pieces (planes or meshes). Openings survive room splits")
@@ -1189,6 +1204,7 @@ class GN_OT_project_openings(Operator):
 
 class GN_OT_clear_openings(Operator):
     bl_idname = "gn_int.clear_openings"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clear Openings"
 
     def execute(self, context):
@@ -1346,6 +1362,7 @@ def _draw_door_ghost(self, context):
 
 class GN_OT_door_edit(Operator):
     bl_idname = "gn_int.door_edit"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Door Edit Mode"
     bl_description = ("Hover a wall to preview a door; LMB = add (cuts both rooms), "
                       "LMB on a door = remove, Tab = next preset, Esc/RMB = exit")
@@ -1402,6 +1419,7 @@ class GN_OT_door_edit(Operator):
 
 class GN_OT_door_preset_add(Operator):
     bl_idname = "gn_int.door_preset_add"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Door Preset"
 
     def execute(self, context):
@@ -1414,6 +1432,7 @@ class GN_OT_door_preset_add(Operator):
 
 class GN_OT_door_preset_remove(Operator):
     bl_idname = "gn_int.door_preset_remove"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Remove Door Preset"
 
     def execute(self, context):
