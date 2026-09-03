@@ -475,8 +475,8 @@ def _make_loop_object(coll, name, poly_xy, z):
     return ob
 
 
-def _wall_spans(A, B, base_z, ceil_z, openings):
-    """Return (d, L, wn, spans) for wall A->B; spans = (x0,x1,z0,z1) holes on it."""
+def _wall_spans(A, B, base_z, ceil_z, openings, win_reveal=0.0, door_reveal=0.0):
+    """Return (d, L, wn, spans) for wall A->B; spans = (x0,x1,z0,z1,reveal)."""
     d = B - A
     L = d.length
     if L < 1e-6:
@@ -497,13 +497,16 @@ def _wall_spans(A, B, base_z, ceil_z, openings):
         z0 = max(base_z, op.sill)
         z1 = min(ceil_z, op.top)
         if x1 - x0 > 0.02 and z1 - z0 > 0.02:
-            spans.append((x0, x1, z0, z1))
+            # a door sits between two rooms (~partition gap apart) -> each side
+            # reveals only to the gap midpoint so the two jambs meet, no overlap
+            rd = door_reveal if op.is_door else win_reveal
+            spans.append((x0, x1, z0, z1, rd))
     return d, L, wn, spans
 
 
-def _build_wall(bm, A, B, base_z, ceil_z, openings, reveal_depth):
-    """Build wall A->B (floor..ceil) with rectangular holes + optional reveal jambs."""
-    r = _wall_spans(A, B, base_z, ceil_z, openings)
+def _build_wall(bm, A, B, base_z, ceil_z, openings, win_reveal, door_reveal):
+    """Build wall A->B (floor..ceil) with rectangular holes + per-opening reveal jambs."""
+    r = _wall_spans(A, B, base_z, ceil_z, openings, win_reveal, door_reveal)
     if not r:
         return
     d, L, wn, spans = r
@@ -511,7 +514,7 @@ def _build_wall(bm, A, B, base_z, ceil_z, openings, reveal_depth):
     zs = sorted(set([base_z, ceil_z] + [v for sp in spans for v in (sp[2], sp[3])]))
 
     def in_hole(cx, cz):
-        for (x0, x1, z0, z1) in spans:
+        for (x0, x1, z0, z1, _rd) in spans:
             if x0 - 1e-6 < cx < x1 + 1e-6 and z0 - 1e-6 < cz < z1 + 1e-6:
                 return True
         return False
@@ -524,23 +527,26 @@ def _build_wall(bm, A, B, base_z, ceil_z, openings, reveal_depth):
                 continue
             bm.faces.new((W(xs[i], zs[j]), W(xs[i + 1], zs[j]),
                           W(xs[i + 1], zs[j + 1]), W(xs[i], zs[j + 1])))
-    # reveal jambs: extrude the opening rim outward (toward the exterior) by reveal_depth
-    if reveal_depth > 1e-4:
-        o = -wn * reveal_depth
+    # reveal jambs: extrude each opening's rim outward by its own reveal depth
+    for (x0, x1, z0, z1, rd) in spans:
+        if rd <= 1e-4:
+            continue
+        o = -wn * rd
 
         def P(x, z, out):
-            base = Vector((A.x + d.x * x, A.y + d.y * x, z))
+            bx, by = A.x + d.x * x, A.y + d.y * x
             if out:
-                base = base + Vector((o.x, o.y, 0.0))
-            return bm.verts.new((base.x, base.y, z))
-        for (x0, x1, z0, z1) in spans:
-            bm.faces.new((P(x0, z0, 0), P(x1, z0, 0), P(x1, z0, 1), P(x0, z0, 1)))  # bottom
-            bm.faces.new((P(x0, z1, 0), P(x1, z1, 0), P(x1, z1, 1), P(x0, z1, 1)))  # top
-            bm.faces.new((P(x0, z0, 0), P(x0, z1, 0), P(x0, z1, 1), P(x0, z0, 1)))  # left
-            bm.faces.new((P(x1, z0, 0), P(x1, z1, 0), P(x1, z1, 1), P(x1, z0, 1)))  # right
+                bx += o.x
+                by += o.y
+            return bm.verts.new((bx, by, z))
+        bm.faces.new((P(x0, z0, 0), P(x1, z0, 0), P(x1, z0, 1), P(x0, z0, 1)))  # bottom
+        bm.faces.new((P(x0, z1, 0), P(x1, z1, 0), P(x1, z1, 1), P(x0, z1, 1)))  # top
+        bm.faces.new((P(x0, z0, 0), P(x0, z1, 0), P(x0, z1, 1), P(x0, z0, 1)))  # left
+        bm.faces.new((P(x1, z0, 0), P(x1, z1, 0), P(x1, z1, 1), P(x1, z0, 1)))  # right
 
 
-def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None, reveal_depth=0.0):
+def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
+                 win_reveal=0.0, door_reveal=0.0):
     bm = bmesh.new()
     n = len(poly_xy)
     # floor/ceiling loops carry the opening cut points too, so their edges weld to the
@@ -571,7 +577,7 @@ def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None, reveal_dept
         pass
     for k in range(n):
         _build_wall(bm, poly_xy[k], poly_xy[(k + 1) % n], base_z, ceil_z,
-                    openings, reveal_depth)
+                    openings, win_reveal, door_reveal)
     bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=1e-4)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     for f in bm.faces:                 # face inward
@@ -665,7 +671,9 @@ def create_room(context, poly_xy, floor_idx):
     rec.poly_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in poly_xy])
     coll = _get_coll(ROOM_COLL)
     ob = _build_shell(coll, f"GN_Room_F{floor_idx+1}_{rec.uid}", poly_xy, base, top,
-                      s.openings, s.wall_margin if s.reveal else 0.0)
+                      s.openings,
+                      (s.wall_margin if s.reveal else 0.0),
+                      (s.partition * 0.5 if s.reveal else 0.0))
     ob["gn_room_uid"] = rec.uid
     return rec
 
@@ -696,7 +704,9 @@ def rebuild_rooms(context):
             continue
         if len(poly) >= 3:
             ob = _build_shell(coll, f"GN_Room_F{r.floor_index+1}_{r.uid}", poly,
-                              base, top, s.openings, s.wall_margin if s.reveal else 0.0)
+                              base, top, s.openings,
+                              (s.wall_margin if s.reveal else 0.0),
+                              (s.partition * 0.5 if s.reveal else 0.0))
             ob["gn_room_uid"] = r.uid
             if r.uid in prev:                 # restore visibility
                 hv, hr, hs = prev[r.uid]
