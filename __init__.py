@@ -316,6 +316,7 @@ class GN_IntProps(PropertyGroup):
     room_index: IntProperty(default=0)
     uid_counter: IntProperty(default=1)
     openings: CollectionProperty(type=GN_Opening)
+    opening_index: IntProperty(default=0)
     reveal: BoolProperty(name="Reveal Jambs", default=True,
         description="Cap the opening sides so windows/doors have depth (the 20cm reveal)")
     door_presets: CollectionProperty(type=GN_DoorPreset)
@@ -1630,6 +1631,24 @@ class GN_OT_preset_remove(Operator):
         return {'FINISHED'}
 
 
+class GN_OT_remove_opening(Operator):
+    bl_idname = "gn_int.remove_opening"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Delete Opening"
+    bl_description = "Delete the selected opening (its hole, frame mesh and threshold)"
+    index: IntProperty(default=-1)
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        i = self.index if self.index >= 0 else s.opening_index
+        if 0 <= i < len(s.openings):
+            remove_opening(context, i)
+            s.opening_index = min(i, len(s.openings) - 1)
+            return {'FINISHED'}
+        self.report({'WARNING'}, "No opening selected")
+        return {'CANCELLED'}
+
+
 # ===========================================================================
 # UI
 # ===========================================================================
@@ -1637,6 +1656,17 @@ class GN_UL_door_presets(bpy.types.UIList):
     def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
         layout.prop(item, "name", text="", emboss=False, icon='MESH_DATA')
         layout.label(text=f"{item.width:.2f}x{item.height:.2f}")
+
+
+class GN_UL_openings(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        row = layout.row(align=True)
+        is_door = item.is_door
+        row.label(text=("Door" if is_door else "Window"),
+                  icon='MOD_BEVEL' if is_door else 'MOD_LATTICE')
+        row.label(text=f"({item.cx:.1f}, {item.cy:.1f})  w{item.hw*2:.2f}")
+        op = row.operator("gn_int.remove_opening", text="", icon='X')
+        op.index = index
 
 
 class GN_UL_floors(bpy.types.UIList):
@@ -1727,7 +1757,13 @@ class GN_PT_openings(_PanelBase, Panel):
         layout.prop(s, "reveal")
         layout.operator("gn_int.project_openings", icon='SELECT_DIFFERENCE')
         layout.label(text="Select window/door pieces, then project", icon='INFO')
-        layout.operator("gn_int.clear_openings", icon='TRASH')
+        if len(s.openings):
+            layout.label(text=f"{len(s.openings)} opening(s) — X deletes one:")
+            layout.template_list("GN_UL_openings", "", s, "openings",
+                                 s, "opening_index", rows=4)
+        row = layout.row(align=True)
+        row.operator("gn_int.remove_opening", text="Delete Selected", icon='X').index = -1
+        row.operator("gn_int.clear_openings", text="Clear All", icon='TRASH')
 
 
 class GN_PT_doors(_PanelBase, Panel):
@@ -1791,8 +1827,8 @@ _classes = (
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
     GN_OT_project_openings, GN_OT_clear_openings,
-    GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove,
-    GN_UL_door_presets, GN_UL_floors,
+    GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
+    GN_UL_door_presets, GN_UL_openings, GN_UL_floors,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
     GN_PT_openings, GN_PT_doors, GN_PT_windows,
 )
