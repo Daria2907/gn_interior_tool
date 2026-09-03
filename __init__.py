@@ -278,6 +278,19 @@ class GN_WindowPreset(PropertyGroup):
         description="Optional window mesh placed as a linked instance at each opening")
 
 
+_SUSPEND_CB = False
+
+
+def _cb_threshold(self, context):
+    """Live-update threshold strips when the toggle/size changes."""
+    if _SUSPEND_CB:
+        return
+    try:
+        _refresh_thresholds(context)
+    except Exception as e:
+        print("[GN Interior] threshold update:", e)
+
+
 class GN_IntProps(PropertyGroup):
     exterior: PointerProperty(name="Exterior Shell", type=bpy.types.Object,
         description="The exterior building shell to read")
@@ -310,12 +323,14 @@ class GN_IntProps(PropertyGroup):
     window_presets: CollectionProperty(type=GN_WindowPreset)
     active_window_preset: IntProperty(default=0)
     add_threshold: BoolProperty(name="Door Threshold", default=False,
-        description="Place a low floor strip across the bottom of each door opening")
+        description="Place a low floor strip across the bottom of each door opening",
+        update=_cb_threshold)
     threshold_height: FloatProperty(name="Threshold Height", default=0.008,
-        min=0.0, max=0.05, unit='LENGTH')
+        min=0.0, max=0.05, unit='LENGTH', update=_cb_threshold)
     threshold_depth: FloatProperty(name="Threshold Depth", default=0.05,
         min=0.005, max=0.5, unit='LENGTH',
-        description="How far the threshold overhangs each side of the doorway")
+        description="How far the threshold overhangs each side of the doorway",
+        update=_cb_threshold)
     partition: FloatProperty(name="Partition Wall", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Gap left between two rooms when splitting "
         "(the interior partition wall thickness)")
@@ -1716,6 +1731,7 @@ def _dump_scene(scene):
 
 
 def _restore_scene(scene):
+    global _SUSPEND_CB
     raw = scene.get("gn_int_backup")
     if not raw:
         return
@@ -1724,11 +1740,15 @@ def _restore_scene(scene):
     except Exception:
         return
     s = scene.gn_int
-    for k, v in data.get("settings", {}).items():
-        try:
-            setattr(s, k, v)
-        except Exception:
-            pass
+    _SUSPEND_CB = True                       # don't fire update callbacks during restore
+    try:
+        for k, v in data.get("settings", {}).items():
+            try:
+                setattr(s, k, v)
+            except Exception:
+                pass
+    finally:
+        _SUSPEND_CB = False
     exn = data.get("exterior")
     if exn and exn in bpy.data.objects:
         s.exterior = bpy.data.objects[exn]
