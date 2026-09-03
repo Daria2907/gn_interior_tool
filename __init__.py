@@ -29,6 +29,7 @@ import bpy
 import bmesh
 import math
 import json
+import numpy as np
 import gpu
 from gpu_extras.batch import batch_for_shader
 from bpy_extras import view3d_utils
@@ -215,6 +216,372 @@ def inset_loop(poly, d):
     return out
 
 
+# ===========================================================================
+# raster silhouette footprint  (robust on fragmented / holey / junky shells)
+#
+# rasterize wall cross-section -> seal gaps (morphological close) -> flood the
+# outside -> the enclosed region is the building -> trace one contour ->
+# simplify -> rectilinearize (straighten walls, drop corner chamfers).
+# Handles non-manifold shells, holes, stray window/stair geometry, fragments.
+# ===========================================================================
+def _cut_segments(src, zc):
+    """Cross-section the shell at height zc -> list of ((x0,y0),(x1,y1))."""
+    bm = src.copy()
+    res = bmesh.ops.bisect_plane(bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:],
+                                 dist=1e-5, plane_co=(0, 0, zc), plane_no=(0, 0, 1))
+    segs = []
+    for e in res['geom_cut']:
+        if isinstance(e, bmesh.types.BMEdge):
+            a = e.verts[0].co
+            b = e.verts[1].co
+            segs.append(((a.x, a.y), (b.x, b.y)))
+    bm.free()
+    return segs
+
+
+def _rast_line(grid, a, b, minx, miny, cell):
+    ax = (a[0] - minx) / cell; ay = (a[1] - miny) / cell
+    bx = (b[0] - minx) / cell; by = (b[1] - miny) / cell
+    n = int(max(abs(bx - ax), abs(by - ay))) + 1
+    H, W = grid.shape
+    for i in range(n + 1):
+        t = i / n
+        c = int(ax + (bx - ax) * t); r = int(ay + (by - ay) * t)
+        if 0 <= r < H and 0 <= c < W:
+            grid[r, c] = True
+
+
+def _rast_dilate(mask, r):
+    out = mask.copy()
+    for _ in range(r):
+        acc = out.copy()
+        acc[1:, :] |= out[:-1, :]; acc[:-1, :] |= out[1:, :]
+        acc[:, 1:] |= out[:, :-1]; acc[:, :-1] |= out[:, 1:]
+        out = acc
+    return out
+
+
+def _rast_erode(mask, r):
+    return ~_rast_dilate(~mask, r)
+
+
+def _rast_flood_border(free):
+    H, W = free.shape
+    out = np.zeros_like(free)
+    stack = []
+    for c in range(W):
+        if free[0, c]: stack.append((0, c))
+        if free[H - 1, c]: stack.append((H - 1, c))
+    for r in range(H):
+        if free[r, 0]: stack.append((r, 0))
+        if free[r, W - 1]: stack.append((r, W - 1))
+    while stack:
+        r, c = stack.pop()
+        if out[r, c] or not free[r, c]:
+            continue
+        out[r, c] = True
+        if r > 0: stack.append((r - 1, c))
+        if r < H - 1: stack.append((r + 1, c))
+        if c > 0: stack.append((r, c - 1))
+        if c < W - 1: stack.append((r, c + 1))
+    return out
+
+
+def _rast_components(mask):
+    H, W = mask.shape
+    seen = np.zeros_like(mask)
+    comps = []
+    for sr in range(H):
+        for sc in range(W):
+            if not mask[sr, sc] or seen[sr, sc]:
+                continue
+            stack = [(sr, sc)]; cells = []
+            while stack:
+                r, c = stack.pop()
+                if seen[r, c] or not mask[r, c]:
+                    continue
+                seen[r, c] = True; cells.append((r, c))
+                if r > 0: stack.append((r - 1, c))
+                if r < H - 1: stack.append((r + 1, c))
+                if c > 0: stack.append((r, c - 1))
+                if c < W - 1: stack.append((r, c + 1))
+            comps.append((len(cells), cells))
+    return comps
+
+
+def _rast_mask_from_cells(shape, cells):
+    m = np.zeros(shape, bool)
+    for r, c in cells:
+        m[r, c] = True
+    return m
+
+
+def _rast_fill_holes(mask):
+    bg = ~mask
+    outside = _rast_flood_border(bg)
+    return mask | (bg & ~outside)
+
+
+def _rast_trace(mask):
+    H, W = mask.shape
+    start = None
+    for r in range(H):
+        for c in range(W):
+            if mask[r, c]:
+                start = (r, c); break
+        if start:
+            break
+    if start is None:
+        return []
+    nbr = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+    def solid(r, c):
+        return 0 <= r < H and 0 <= c < W and mask[r, c]
+
+    contour = [start]; cur = start; b = 6; count = 0; maxc = H * W * 4
+    while count < maxc:
+        count += 1; found = False
+        for k in range(8):
+            d = (b + 1 + k) % 8
+            nr = cur[0] + nbr[d][0]; nc = cur[1] + nbr[d][1]
+            if solid(nr, nc):
+                b = (d + 4) % 8; cur = (nr, nc); found = True; break
+        if not found:
+            break
+        if cur == start and len(contour) > 2:
+            break
+        contour.append(cur)
+    return contour
+
+
+def _r_dp(pts, tol):
+    if len(pts) < 3:
+        return pts
+    ax, ay = pts[0]; bx, by = pts[-1]
+    dx, dy = bx - ax, by - ay
+    L = math.hypot(dx, dy)
+    dmax, idx = 0.0, 0
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i]
+        if L < 1e-9:
+            d = math.hypot(px - ax, py - ay)
+        else:
+            d = abs((px - ax) * dy - (py - ay) * dx) / L
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax > tol:
+        return _r_dp(pts[:idx + 1], tol)[:-1] + _r_dp(pts[idx:], tol)
+    return [pts[0], pts[-1]]
+
+
+def _r_dp_closed(poly, tol):
+    if len(poly) < 4:
+        return poly
+    a = poly[0]
+    far = max(range(len(poly)),
+              key=lambda i: (poly[i][0] - a[0]) ** 2 + (poly[i][1] - a[1]) ** 2)
+    s1 = _r_dp(poly[:far + 1], tol)
+    s2 = _r_dp(poly[far:] + [poly[0]], tol)
+    out = s1[:-1] + s2[:-1]
+    return out if len(out) >= 3 else poly
+
+
+def _r_area(pts):
+    a = 0.0; n = len(pts)
+    for i in range(n):
+        a += pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+    return a * 0.5
+
+
+def _line_isect(p0, d0, p1, d1):
+    if d0 is None or d1 is None:
+        return None
+    den = d0[0] * d1[1] - d0[1] * d1[0]
+    if abs(den) < 1e-9:
+        return None
+    dx = p1[0] - p0[0]; dy = p1[1] - p0[1]
+    t = (dx * d1[1] - dy * d1[0]) / den
+    return (p0[0] + d0[0] * t, p0[1] + d0[1] * t)
+
+
+def _dom_orient(poly):
+    """Length-weighted dominant orientation (radians, mod 90deg)."""
+    sx = sy = 0.0; n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]; bx, by = poly[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy)
+        if L < 1e-6:
+            continue
+        a = math.atan2(dy, dx) % (math.pi / 2)
+        sx += L * math.cos(4 * a); sy += L * math.sin(4 * a)
+    if sx == 0 and sy == 0:
+        return 0.0
+    return (math.atan2(sy, sx) / 4.0) % (math.pi / 2)
+
+
+def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=False):
+    """Straighten walls to the dominant axis and drop short off-grid corner
+    chamfers so corners are the two long walls meeting directly. Genuine long
+    angled walls keep their true angle."""
+    n = len(poly)
+    if n < 4:
+        return poly
+    th0 = _dom_orient(poly)
+    tol = math.radians(ang_tol_deg)
+    grid = [th0, th0 + math.pi / 2]
+    if allow45:
+        grid += [th0 + math.pi / 4, th0 + 3 * math.pi / 4]
+    edges = []
+    for i in range(n):
+        ax, ay = poly[i]; bx, by = poly[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy)
+        if L < 1e-6:
+            continue
+        a = math.atan2(dy, dx); best = None; bestd = 1e9
+        for g in grid:
+            for gg in (g, g + math.pi):
+                d = abs(((a - gg + math.pi) % (2 * math.pi)) - math.pi)
+                if d < bestd:
+                    bestd = d; best = gg
+        if bestd <= tol:
+            d_unit = (math.cos(best), math.sin(best)); snp = True
+        else:
+            d_unit = (dx / L, dy / L); snp = False
+        edges.append((ax, ay, bx, by, d_unit[0], d_unit[1], L, snp))
+    m = len(edges)
+    if m < 4:
+        return poly
+
+    def same_dir(e, f):
+        cross = e[4] * f[5] - e[5] * f[4]
+        dot = e[4] * f[4] + e[5] * f[5]
+        return abs(cross) < 1e-4 and dot > 0.5
+
+    start = 0
+    for i in range(m):
+        if not same_dir(edges[i - 1], edges[i]):
+            start = i; break
+    runs = []; i = 0; order = [(start + k) % m for k in range(m)]
+    while i < m:
+        j = order[i]; dirx, diry = edges[j][4], edges[j][5]
+        wx = wy = wsum = 0.0; length = 0.0; k = i
+        while k < m and same_dir(edges[order[k]], edges[j]):
+            e = edges[order[k]]
+            mx = (e[0] + e[2]) / 2; my = (e[1] + e[3]) / 2
+            wx += mx * e[6]; wy += my * e[6]; wsum += e[6]; length += e[6]; k += 1
+        runs.append([(wx / wsum, wy / wsum), (dirx, diry), length, edges[j][7]])
+        i = k
+
+    def keep(r):
+        _, _, length, snp = r
+        return length >= min_edge if snp else length > corner_max
+
+    surv = [r for r in runs if keep(r)]
+    if len(surv) < 4:
+        surv = [r for r in runs if r[2] >= min_edge] or runs
+    out = []
+    for i in range(len(surv)):
+        p = _line_isect(surv[i - 1][0], surv[i - 1][1], surv[i][0], surv[i][1])
+        out.append(p if p else surv[i][0])
+    cleaned = [out[0]]
+    for p in out[1:]:
+        if math.hypot(p[0] - cleaned[-1][0], p[1] - cleaned[-1][1]) > 1e-3:
+            cleaned.append(p)
+    if len(cleaned) > 2 and math.hypot(cleaned[0][0] - cleaned[-1][0],
+                                       cleaned[0][1] - cleaned[-1][1]) <= 1e-3:
+        cleaned.pop()
+    cleaned = _despike(cleaned)
+    return cleaned if len(cleaned) >= 3 else poly
+
+
+def _turn_angle(a, b, c):
+    """Deviation (deg) from straight at b: 0 = straight, 90 = corner, 180 = reversal."""
+    v1x, v1y = b[0] - a[0], b[1] - a[1]
+    v2x, v2y = c[0] - b[0], c[1] - b[1]
+    L1 = math.hypot(v1x, v1y); L2 = math.hypot(v2x, v2y)
+    if L1 < 1e-9 or L2 < 1e-9:
+        return 0.0
+    dot = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (L1 * L2)))
+    return math.degrees(math.acos(dot))
+
+
+def _despike(poly, straight_deg=6.0, spike_deg=150.0):
+    """Drop vertices that are redundant (nearly straight) or spikes (the path
+    nearly reverses -- thin slivers). Rectilinear footprints only turn ~90deg,
+    so a reversal is always an artifact."""
+    poly = list(poly)
+    changed = True
+    while changed and len(poly) > 3:
+        changed = False
+        n = len(poly)
+        for i in range(n):
+            t = _turn_angle(poly[(i - 1) % n], poly[i], poly[(i + 1) % n])
+            if t < straight_deg or t > spike_deg:
+                del poly[i]; changed = True; break
+    return poly
+
+
+def raster_footprint(segs, tol=0.15, cell=0.05, seed=None, bridge=0.5,
+                     square=True, ang_tol_deg=20.0, allow45=False):
+    """segs -> ONE clean CCW footprint polygon [(x,y),...] (world units), or None.
+
+    tol    = detail size to ignore (metres).
+    bridge = max wall gap/hole to seal (metres).
+    seed   = (x, y) interior point to disambiguate which region is the building.
+    square = rectilinearize the result (straight walls, crisp corners).
+    """
+    if not segs:
+        return None
+    xs = [p[0] for s in segs for p in s]
+    ys = [p[1] for s in segs for p in s]
+    R = max(1, int(round(bridge * 0.5 / cell)))
+    pad = (R + 3) * cell
+    minx, miny = min(xs) - pad, min(ys) - pad
+    maxx, maxy = max(xs) + pad, max(ys) + pad
+    W = int((maxx - minx) / cell) + 1
+    H = int((maxy - miny) / cell) + 1
+    if W * H > 6_000_000:               # safety: keep grids sane on huge shells
+        cell = math.sqrt((maxx - minx) * (maxy - miny) / 4_000_000.0)
+        R = max(1, int(round(bridge * 0.5 / cell)))
+        W = int((maxx - minx) / cell) + 1
+        H = int((maxy - miny) / cell) + 1
+    wall = np.zeros((H, W), bool)
+    for a, b in segs:
+        _rast_line(wall, a, b, minx, miny, cell)
+    wall = _rast_dilate(wall, R)
+    outside = _rast_flood_border(~wall)
+    solid = ~outside
+    solid = _rast_erode(solid, R)
+    solid = _rast_fill_holes(solid)
+    comps = _rast_components(solid)
+    if not comps:
+        return None
+    chosen = None
+    if seed is not None:
+        sc = int((seed[0] - minx) / cell); sr = int((seed[1] - miny) / cell)
+        for size, cells in comps:
+            if (sr, sc) in set(cells):
+                chosen = cells; break
+    if chosen is None:
+        comps.sort(key=lambda x: x[0], reverse=True)
+        chosen = comps[0][1]
+    region = _rast_fill_holes(_rast_mask_from_cells((H, W), chosen))
+    contour = _rast_trace(region)
+    if len(contour) < 3:
+        return None
+    poly = [(minx + (c + 0.5) * cell, miny + (rr + 0.5) * cell) for rr, c in contour]
+    poly = _r_dp_closed(poly, tol)
+    if square:
+        poly = regularize(poly, ang_tol_deg=ang_tol_deg,
+                          min_edge=max(tol, 0.15), corner_max=max(tol * 4, 0.7),
+                          allow45=allow45)
+    if _r_area(poly) < 0:
+        poly = poly[::-1]
+    return poly
+
+
 def _get_coll(name):
     c = bpy.data.collections.get(name)
     if c is None:
@@ -232,14 +599,27 @@ def _clear_coll(name):
             bpy.data.objects.remove(ob, do_unlink=True)
 
 
+def _clear_named(coll, name):
+    """Remove any object in coll whose name matches (base or .NNN suffix)."""
+    for ob in list(coll.objects):
+        if ob.name == name or ob.name.startswith(name + "."):
+            bpy.data.objects.remove(ob, do_unlink=True)
+
+
 # ===========================================================================
 # properties
 # ===========================================================================
 class GN_FloorLevel(PropertyGroup):
     z: FloatProperty(name="Base Z", default=0.0, unit='LENGTH')
     top: FloatProperty(name="Top Z", default=0.0, unit='LENGTH',
-        description="Ceiling Z. 0 = auto (base + Room Height)")
+        description="Ceiling Z (only used when Custom Top is on; otherwise "
+        "base + Room Height)")
+    top_is_custom: BoolProperty(default=False,
+        description="Use this floor's explicit Top Z instead of base + Room Height")
     bound_json: StringProperty(default="")   # inset boundary polygon [[x,y],...]
+    lock: BoolProperty(name="Lock", default=False,
+        description="Lock this floor's boundary: Generate Boundaries skips it so "
+        "hand edits are preserved")
 
 
 class GN_Room(PropertyGroup):
@@ -282,14 +662,98 @@ class GN_WindowPreset(PropertyGroup):
 _SUSPEND_CB = False
 
 
+class _SceneCtx:
+    """Minimal context-like shim (only .scene) for calling context-taking
+    helpers from a deferred bpy.app.timers callback, where no real bpy
+    Context is available."""
+    __slots__ = ("scene",)
+
+    def __init__(self, scene):
+        self.scene = scene
+
+
 def _cb_threshold(self, context):
-    """Live-update threshold strips when the toggle/size changes."""
+    """Live-update threshold strips when the toggle/size changes.
+
+    Deferred via a timer: rebuilding objects directly inside a property
+    update callback can crash Blender if the callback fires while undo/redo
+    is being processed (property restores during undo can trigger update
+    callbacks). Scheduling it for the next event-loop tick avoids that
+    reentrancy entirely -- same pattern as this add-on's reload-recovery.
+    """
     if _SUSPEND_CB:
         return
-    try:
-        _refresh_thresholds(context)
-    except Exception as e:
-        print("[GN Interior] threshold update:", e)
+    scene_name = context.scene.name
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int") or _SUSPEND_CB:
+            return None
+        try:
+            _refresh_thresholds(_SceneCtx(scene))
+        except Exception as e:
+            print("[GN Interior] threshold update:", e)
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
+def _cb_floor_select(self, context):
+    """Selecting a floor in the list selects its boundary + rooms in the
+    scene, so the Outliner and viewport highlight what you're looking at.
+
+    Deferred via a timer: mutating object selection directly inside a
+    property update callback can crash Blender if the callback fires while
+    undo/redo is being processed (property restores during undo can trigger
+    update callbacks). Scheduling it for the next event-loop tick avoids that
+    reentrancy entirely -- same pattern as this add-on's reload-recovery.
+    """
+    scene_name = context.scene.name
+    idx = context.scene.gn_int.floor_index
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        s = scene.gn_int
+        if s.floor_index != idx or not (0 <= idx < len(s.floors)):
+            return None
+        try:
+            for ob in bpy.context.selectable_objects:
+                ob.select_set(False)
+        except Exception:
+            pass
+        floor = s.floors[idx]
+        picked = []
+        bnd = _boundary_object_for_floor(floor)
+        if bnd:
+            picked.append(bnd)
+        room_coll = bpy.data.collections.get(ROOM_COLL)
+        if room_coll:
+            room_uids = {r.uid for r in s.rooms if r.floor_index == idx}
+            for ob in room_coll.objects:
+                if ob.get("gn_room_uid") in room_uids:
+                    picked.append(ob)
+        for ob in picked:
+            try:
+                ob.select_set(True)
+            except Exception:
+                pass
+        if picked:
+            try:
+                bpy.context.view_layer.objects.active = picked[0]
+            except Exception:
+                pass
+        try:
+            for w in bpy.context.window_manager.windows:
+                for a in w.screen.areas:
+                    if a.type == 'VIEW_3D':
+                        a.tag_redraw()
+        except Exception:
+            pass
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
 
 
 def _cb_redraw(self, context):
@@ -318,11 +782,28 @@ class GN_IntProps(PropertyGroup):
     cleanup: FloatProperty(name="Cleanup", default=0.08, min=0.0, max=0.5,
         unit='LENGTH', description="Simplify the outline: remove wiggles/slivers "
         "smaller than this (metres). Keeps real corners. 0 = exact outline")
+    detail_tol: FloatProperty(name="Ignore Details <", default=0.15, min=0.0, max=1.0,
+        unit='LENGTH', description="Boundary: ignore wall detail smaller than this "
+        "(window reveals, tiny jogs). Bigger = simpler outline")
+    bridge: FloatProperty(name="Bridge Gaps <", default=0.5, min=0.0, max=3.0,
+        unit='LENGTH', description="Boundary: seal holes and gaps in the shell up "
+        "to this size (non-manifold buildings, missing walls)")
+    square: BoolProperty(name="Square Walls", default=True,
+        description="Boundary: straighten walls to the building's main axis and "
+        "make corners crisp (recommended). Off = follow the raw outline")
+    ang_tol: FloatProperty(name="Square Angle", default=20.0, min=0.0, max=45.0,
+        description="A wall within this many degrees of the main axis is "
+        "straightened to it; further off, it keeps its real angle")
+    allow45: BoolProperty(name="Allow 45°", default=False,
+        description="Also snap walls to 45° diagonals (for buildings with "
+        "diagonal wings)")
     uv_scale: FloatProperty(name="UV Scale", default=2.0, min=0.05, max=20.0,
         unit='LENGTH', description="Cube-UV texture size: a texture tiles every "
         "this many metres")
     floors: CollectionProperty(type=GN_FloorLevel)
-    floor_index: IntProperty(default=0)
+    new_floor_z: FloatProperty(name="Z", default=0.0, unit='LENGTH',
+        description="Base Z for the next floor added via 'Add Floor at Z'")
+    floor_index: IntProperty(default=0, update=_cb_floor_select)
     active_floor: IntProperty(name="Draw on Floor", default=0, min=0,
         description="Which floor new rooms are drawn on")
     snap: FloatProperty(name="Grid Snap", default=0.10, min=0.0, max=1.0,
@@ -384,7 +865,9 @@ class GN_OT_add_floor_sel(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Floor from Selected Edge"
     bl_description = ("Add a floor level at the Z of the selected geometry "
-                      "(select a facade edge in Edit Mode)")
+                      "(select a facade edge in Edit Mode). Height is always "
+                      "Room Height - use the floor list's Top field for a custom "
+                      "height on a specific floor")
 
     def execute(self, context):
         ob = context.active_object
@@ -397,38 +880,129 @@ class GN_OT_add_floor_sel(Operator):
         if not sel:
             self.report({'ERROR'}, "No vertices selected")
             return {'CANCELLED'}
-        zs = sorted((ob.matrix_world @ v.co).z for v in sel)
-        # two distinct height clusters -> bottom + top (custom height); else base only
-        base = zs[0]
-        top = 0.0
-        if zs[-1] - zs[0] > 0.15:      # spans two edges at different heights
-            base = zs[0]
-            top = zs[-1]
+        base = min((ob.matrix_world @ v.co).z for v in sel)
         it = s.floors.add()
         it.z = round(base, 3)
-        it.top = round(top, 3)
         _sort_floors(s)
-        h = (top - base) if top > 0 else s.room_height
-        self.report({'INFO'}, f"Added floor at z={base:.2f} (height {h:.2f} m)")
+        self.report({'INFO'}, f"Added floor at z={base:.2f} (height = Room Height, "
+                              f"{s.room_height:.2f} m)")
         return {'FINISHED'}
 
 
-class GN_OT_add_floor_ground(Operator):
-    bl_idname = "gn_int.add_floor_ground"
+
+
+class GN_OT_add_floor_z(Operator):
+    bl_idname = "gn_int.add_floor_z"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Add Ground Floor"
-    bl_description = "Add a floor level at the base of the exterior shell"
+    bl_label = "Add Floor at Z"
+    bl_description = "Add a floor level at the typed Z height, no geometry needed"
 
     def execute(self, context):
+        s = context.scene.gn_int
+        it = s.floors.add()
+        it.z = round(s.new_floor_z, 3)
+        _sort_floors(s)
+        self.report({'INFO'}, f"Added floor at z={s.new_floor_z:.2f}")
+        return {'FINISHED'}
+
+
+def _draw_slice_overlay(self, context):
+    if not self._segs:
+        return
+    z = self._z
+    pts = []
+    for a, b in self._segs:
+        pts.append((a[0], a[1], z))
+        pts.append((b[0], b[1], z))
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'LINES', {"pos": pts})
+    gpu.state.line_width_set(2.5)
+    gpu.state.blend_set('ALPHA')
+    shader.bind()
+    shader.uniform_float("color", (0.25, 0.85, 1.0, 1.0))
+    batch.draw(shader)
+    gpu.state.line_width_set(1.0)
+
+
+class GN_OT_pick_floor_z(Operator):
+    bl_idname = "gn_int.pick_floor_z"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Slice for Floor Height"
+    bl_description = ("Drag to slide a live cross-section up/down through the "
+                      "exterior and see the real wall outline at each height, "
+                      "then click to add a floor there. The exterior mesh is "
+                      "never modified - only a throwaway copy is cut for preview")
+
+    def invoke(self, context, event):
         s = context.scene.gn_int
         ex = s.exterior
         if not ex:
             self.report({'ERROR'}, "Set an exterior shell first")
             return {'CANCELLED'}
-        zmin = min((ex.matrix_world @ v.co).z for v in ex.data.vertices)
+        self._src = _eval_bmesh(ex, context)
+        if s.floors:
+            top_floor = max(s.floors, key=lambda f: f.z)
+            start = (top_floor.top if top_floor.top_is_custom else
+                     top_floor.z + s.room_height) + s.floor_gap
+        else:
+            start = min((ex.matrix_world @ v.co).z for v in ex.data.vertices)
+        self._z = start
+        self._segs = _cut_segments(self._src, self._z)
+        self._last_mouse_y = event.mouse_y
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_slice_overlay, (self, context), 'WINDOW', 'POST_VIEW')
+        context.window_manager.modal_handler_add(self)
+        self._update_header(context)
+        return {'RUNNING_MODAL'}
+
+    def _update_header(self, context):
+        context.area.header_text_set(
+            f"Slice for Floor Height:  z = {self._z:.3f} m   |   "
+            "move mouse: slide  ·  Shift: fine  ·  wheel: nudge 2cm  ·  "
+            "Click/Enter: confirm  ·  Esc: cancel")
+
+    def _retag(self, context):
+        self._segs = _cut_segments(self._src, self._z)
+        if context.area:
+            context.area.tag_redraw()
+        self._update_header(context)
+
+    def modal(self, context, event):
+        if event.type == 'MOUSEMOVE':
+            dy = event.mouse_y - self._last_mouse_y
+            self._last_mouse_y = event.mouse_y
+            sens = 0.001 if event.shift else 0.01
+            self._z += dy * sens
+            self._retag(context)
+            return {'RUNNING_MODAL'}
+        if event.type == 'WHEELUPMOUSE' and event.value == 'PRESS':
+            self._z += 0.02
+            self._retag(context)
+            return {'RUNNING_MODAL'}
+        if event.type == 'WHEELDOWNMOUSE' and event.value == 'PRESS':
+            self._z -= 0.02
+            self._retag(context)
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value == 'PRESS':
+            return self._end(context, True)
+        if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+            return self._end(context, False)
+        return {'RUNNING_MODAL'}
+
+    def _end(self, context, confirmed):
+        bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+        context.area.header_text_set(None)
+        z = self._z
+        self._src.free()
+        if context.area:
+            context.area.tag_redraw()
+        if not confirmed:
+            return {'CANCELLED'}
+        s = context.scene.gn_int
         it = s.floors.add()
-        it.z = round(zmin, 3)
+        it.z = round(z, 3)
         _sort_floors(s)
+        self.report({'INFO'}, f"Added floor at z={z:.3f}")
         return {'FINISHED'}
 
 
@@ -446,12 +1020,16 @@ class GN_OT_remove_floor(Operator):
 
 
 def _sort_floors(s):
-    data = sorted(((f.z, f.top) for f in s.floors), key=lambda t: t[0])
+    data = sorted(((f.z, f.top, f.top_is_custom, f.bound_json, f.lock)
+                   for f in s.floors), key=lambda t: t[0])
     s.floors.clear()
-    for z, top in data:
+    for z, top, top_is_custom, bound_json, lock in data:
         it = s.floors.add()
         it.z = z
         it.top = top
+        it.top_is_custom = top_is_custom
+        it.bound_json = bound_json
+        it.lock = lock
 
 
 def _floor_tops(context):
@@ -460,11 +1038,12 @@ def _floor_tops(context):
     Per-floor top override wins; otherwise base + global Room Height.
     """
     s = context.scene.gn_int
-    floors = sorted(((f.z, f.top) for f in s.floors), key=lambda t: t[0])
+    floors = sorted(((f.z, f.top, f.top_is_custom) for f in s.floors),
+                    key=lambda t: t[0])
     out = []
-    for i, (b, custom_top) in enumerate(floors):
+    for i, (b, custom_top, is_custom) in enumerate(floors):
         nxt = floors[i + 1][0] if i + 1 < len(floors) else None
-        top = custom_top if custom_top > b + 0.1 else b + s.room_height
+        top = custom_top if is_custom else b + s.room_height
         out.append((b, top, nxt))
     return out
 
@@ -473,7 +1052,8 @@ class GN_OT_gen_boundaries(Operator):
     bl_idname = "gn_int.gen_boundaries"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Generate Boundaries"
-    bl_description = "Create a per-floor boundary outline (exterior inset by the margin)"
+    bl_description = ("Create the boundary outline for the SELECTED floor only "
+                      "(exterior inset by the margin). Other floors are untouched")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -481,27 +1061,47 @@ class GN_OT_gen_boundaries(Operator):
         if not ex:
             self.report({'ERROR'}, "Set an exterior shell")
             return {'CANCELLED'}
-        if not s.floors:
-            self.report({'ERROR'}, "Add at least one floor level")
+        if not (0 <= s.floor_index < len(s.floors)):
+            self.report({'ERROR'}, "Select a floor in the list")
             return {'CANCELLED'}
+        target = s.floors[s.floor_index]
+        if target.lock and target.bound_json:
+            self.report({'INFO'}, "Floor is locked - boundary kept as-is")
+            return {'CANCELLED'}
+        # find this floor's (base, top) among the z-sorted, gap-honoring list
+        tops = _floor_tops(context)
+        sorted_idx = sorted(range(len(s.floors)), key=lambda k: s.floors[k].z)
+        pos = sorted_idx.index(s.floor_index)
+        base, top, nxt = tops[pos]
+
         src = _eval_bmesh(ex, context)
-        _clear_coll(BOUND_COLL)
         coll = _get_coll(BOUND_COLL)
-        made = 0
-        for i, f in enumerate(_floor_tops(context)):
-            base, top, nxt = f
-            poly = outer_footprint(src, base + s.sample_offset)
-            if not poly:
-                self.report({'WARNING'}, f"Floor {i+1}: no solid outline at z={base+s.sample_offset:.2f}")
-                continue
-            poly = simplify_loop(poly, s.cleanup)
-            ip = _weld_loop(inset_loop(poly, s.wall_margin), max(s.cleanup*0.4, 0.005))
-            _make_loop_object(coll, f"GN_Bound_Floor{i+1}", ip, base)
-            if i < len(s.floors):
-                s.floors[i].bound_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in ip])
-            made += 1
+        zc = base + s.sample_offset
+        segs = _cut_segments(src, zc)
+        poly_t = raster_footprint(
+            segs, tol=s.detail_tol, cell=0.05, seed=None, bridge=s.bridge,
+            square=s.square, ang_tol_deg=s.ang_tol, allow45=s.allow45)
+        fell_back = False
+        if not poly_t or len(poly_t) < 3:
+            old = outer_footprint(src, zc)
+            if old:
+                poly_t = [(p.x, p.y) for p in simplify_loop(old, s.cleanup)]
+                fell_back = True
         src.free()
-        self.report({'INFO'}, f"Generated {made} floor boundaries")
+        if not poly_t or len(poly_t) < 3:
+            self.report({'WARNING'}, f"No outline found at z={zc:.2f}")
+            return {'CANCELLED'}
+        poly = [Vector(p) for p in poly_t]
+        ip = _weld_loop(inset_loop(poly, s.wall_margin),
+                        max(s.detail_tol * 0.4, 0.005))
+        _clear_named(coll, f"GN_Bound_Floor{pos+1}")
+        _make_loop_object(coll, f"GN_Bound_Floor{pos+1}", ip, base)
+        target.bound_json = json.dumps(
+            [[round(p.x, 4), round(p.y, 4)] for p in ip])
+        msg = f"Generated boundary for Floor {s.floor_index+1}"
+        if fell_back:
+            msg += " (fell back to legacy method)"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -534,6 +1134,74 @@ def _make_loop_object(coll, name, poly_xy, z):
     ob.show_in_front = True
     ob.display_type = 'WIRE'
     return ob
+
+
+def _ordered_loop_xy(ob):
+    """Walk ob's edge loop in order -> world-space XY polygon [(x,y),...]."""
+    me = ob.data
+    if len(me.vertices) < 3:
+        return None
+    adj = {}
+    for e in me.edges:
+        a, b = e.vertices[0], e.vertices[1]
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    if not adj:
+        return None
+    start = next(iter(adj))
+    order = [start]
+    prev = None
+    cur = start
+    while True:
+        nxts = [v for v in adj.get(cur, []) if v != prev]
+        if not nxts:
+            break
+        nxt = nxts[0]
+        if nxt == start:
+            break
+        order.append(nxt)
+        prev, cur = cur, nxt
+        if len(order) > len(me.vertices):
+            break
+    mat = ob.matrix_world
+    return [((mat @ me.vertices[i].co).x, (mat @ me.vertices[i].co).y) for i in order]
+
+
+def _boundary_object_for_floor(floor, tol=0.05):
+    """Find the GN_Bound_Floor* object for this floor, matched by Z (not name)
+    so it's correct even if floors were added out of Z order."""
+    coll = bpy.data.collections.get(BOUND_COLL)
+    if not coll:
+        return None
+    best_ob = None
+    best_dz = 1e9
+    for ob in coll.objects:
+        me = ob.data
+        if not me or len(me.vertices) < 3:
+            continue
+        z0 = (ob.matrix_world @ me.vertices[0].co).z
+        dz = abs(z0 - floor.z)
+        if dz < best_dz:
+            best_dz = dz
+            best_ob = ob
+    return best_ob if best_ob is not None and best_dz < tol else None
+
+
+def _read_boundary_poly(floor):
+    """Read the CURRENT boundary mesh for this floor (picks up hand edits made
+    in Edit Mode, which never touch floor.bound_json). Falls back to the
+    stored bound_json if no live boundary object is found."""
+    best_ob = _boundary_object_for_floor(floor)
+    if best_ob is not None:
+        poly = _ordered_loop_xy(best_ob)
+        if poly and len(poly) >= 3:
+            return poly
+    if floor.bound_json:
+        try:
+            return [tuple(p) for p in json.loads(floor.bound_json)]
+        except Exception:
+            pass
+    return None
 
 
 # surface material slots (index order used by _build_wall / _build_shell)
@@ -878,18 +1546,41 @@ def split_polygon(poly, A, B, gap):
     return pos, neg
 
 
-def seed_rooms_from_boundaries(context):
-    """Make one room per floor = that floor's whole boundary polygon."""
+def seed_rooms_from_boundaries(context, floor_idx=None):
+    """Make one room = the SELECTED floor's whole boundary polygon (all floors
+    if floor_idx is None). Rooms on OTHER floors -- including any splits
+    already made there -- are left completely untouched.
+
+    Reads the LIVE boundary mesh (picks up hand edits) rather than the
+    bound_json snapshot from when Generate Boundaries last ran.
+    Returns the number of floors seeded.
+    """
     s = context.scene.gn_int
+    targets = {floor_idx} if floor_idx is not None else set(range(len(s.floors)))
+    keep = [(r.floor_index, r.poly_json, r.uid) for r in s.rooms
+            if r.floor_index not in targets]
     s.rooms.clear()
-    for i, f in enumerate(s.floors):
-        if not f.bound_json:
+    for fi, poly_json, uid in keep:
+        rec = s.rooms.add()
+        rec.floor_index = fi
+        rec.poly_json = poly_json
+        rec.uid = uid
+    made = 0
+    for i in sorted(targets):
+        if not (0 <= i < len(s.floors)):
+            continue
+        f = s.floors[i]
+        poly = _read_boundary_poly(f)
+        if not poly:
             continue
         rec = s.rooms.add()
         rec.floor_index = i
         rec.uid = _new_uid(s)
-        rec.poly_json = f.bound_json
+        rec.poly_json = json.dumps([[round(p[0], 4), round(p[1], 4)] for p in poly])
+        f.bound_json = rec.poly_json   # keep the snapshot in sync with the edit
+        made += 1
     rebuild_rooms(context)
+    return made
 
 
 def split_room_record(context, room_idx, A, B):
@@ -1121,20 +1812,24 @@ class GN_OT_clear_rooms(Operator):
 class GN_OT_seed_rooms(Operator):
     bl_idname = "gn_int.seed_rooms"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Rooms = Envelope"
-    bl_description = ("Start room-making: one room per floor = that floor's whole "
-                      "envelope. Then split it into rooms")
+    bl_label = "Make Floor Walls"
+    bl_description = ("Reset the SELECTED floor to one room = its whole envelope, "
+                      "ready to split. Other floors (and any splits already made "
+                      "there) are left untouched")
 
     def execute(self, context):
-        if not context.scene.gn_int.floors:
+        s = context.scene.gn_int
+        if not s.floors:
             self.report({'ERROR'}, "Generate boundaries first")
             return {'CANCELLED'}
-        seed_rooms_from_boundaries(context)
-        n = len(context.scene.gn_int.rooms)
-        if n == 0:
-            self.report({'WARNING'}, "No boundaries stored - run Generate Boundaries")
+        if not (0 <= s.floor_index < len(s.floors)):
+            self.report({'ERROR'}, "Select a floor in the list")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Seeded {n} room(s) from the envelope")
+        made = seed_rooms_from_boundaries(context, s.floor_index)
+        if made == 0:
+            self.report({'WARNING'}, "No boundary for this floor - run Generate Boundaries")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Floor {s.floor_index+1} reset to its envelope")
         return {'FINISHED'}
 
 
@@ -1791,11 +2486,14 @@ class GN_UL_openings(bpy.types.UIList):
 class GN_UL_floors(bpy.types.UIList):
     def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
         s = ctx.scene.gn_int
-        h = (item.top - item.z) if item.top > item.z + 0.1 else s.room_height
+        h = (item.top - item.z) if item.top_is_custom else s.room_height
         row = layout.row(align=True)
         row.label(text=f"Floor {index+1}", icon='DECORATE')
         row.label(text=f"z {item.z:.2f}  h {h:.2f}m")
-        op = row.operator("gn_int.remove_floor", text="", icon='X')
+        # lock: keep a hand-edited boundary (Generate skips locked floors)
+        row.prop(item, "lock", text="",
+                 icon='LOCKED' if item.lock else 'UNLOCKED', emboss=False)
+        op = row.operator("gn_int.remove_floor", text="", icon='TRASH')
         op.index = index
 
 
@@ -1823,11 +2521,8 @@ class GN_PT_setup(_PanelBase, Panel):
     def draw(self, context):
         s = context.scene.gn_int
         col = self.layout.column(align=True)
-        col.prop(s, "wall_margin")
         col.prop(s, "room_height")
         col.prop(s, "floor_gap")
-        col.prop(s, "sample_offset")
-        col.prop(s, "cleanup")
         col.prop(s, "uv_scale")
 
 
@@ -1839,10 +2534,37 @@ class GN_PT_floors(_PanelBase, Panel):
         s = context.scene.gn_int
         layout = self.layout
         layout.template_list("GN_UL_floors", "", s, "floors", s, "floor_index", rows=3)
-        r = layout.row(align=True)
-        r.operator("gn_int.add_floor_ground", icon='TRIA_DOWN_BAR')
-        r.operator("gn_int.add_floor_sel", text="From Edge", icon='EDGESEL')
+        if 0 <= s.floor_index < len(s.floors):
+            f = s.floors[s.floor_index]
+            row = layout.row(align=True)
+            row.prop(f, "top_is_custom", text=f"Custom height (Floor {s.floor_index+1})")
+            sub = row.row(align=True)
+            sub.enabled = f.top_is_custom
+            sub.prop(f, "top", text="Top Z")
+        layout.operator("gn_int.add_floor_sel", text="From Edge", icon='EDGESEL')
+        layout.operator("gn_int.pick_floor_z", text="Slice for Floor Height",
+                        icon='EMPTY_SINGLE_ARROW')
+        r2 = layout.row(align=True)
+        r2.prop(s, "new_floor_z")
+        r2.operator("gn_int.add_floor_z", text="Add at Z")
+
+        box = layout.box()
+        box.label(text="Boundary cleanup", icon='MOD_BEVEL')
+        col = box.column(align=True)
+        col.prop(s, "detail_tol")
+        col.prop(s, "bridge")
+        col.prop(s, "wall_margin")
+        col.prop(s, "sample_offset")
+        row = box.row(align=True)
+        row.prop(s, "square", toggle=True)
+        sub = row.row(align=True)
+        sub.enabled = s.square
+        sub.prop(s, "ang_tol")
+        sub.prop(s, "allow45", toggle=True)
+        box.label(text="Lock a floor to keep hand-edited boundaries", icon='INFO')
+
         layout.operator("gn_int.gen_boundaries", icon='MESH_GRID')
+        layout.operator("gn_int.seed_rooms", icon='MESH_PLANE')
         layout.operator("gn_int.clear", icon='TRASH')
 
 
@@ -1853,11 +2575,7 @@ class GN_PT_rooms(_PanelBase, Panel):
     def draw(self, context):
         s = context.scene.gn_int
         layout = self.layout
-        row = layout.row(align=True)
-        row.prop(s, "active_floor")
-        row.prop(s, "snap")
         layout.prop(s, "partition")
-        layout.operator("gn_int.seed_rooms", icon='MESH_PLANE')
         layout.operator("gn_int.split_edges", icon='MOD_BEVEL')
         layout.label(text="Edit Mode: pick 2 wall edges, then Split", icon='INFO')
         layout.label(text=f"{len(s.rooms)} room(s)")
@@ -1943,7 +2661,8 @@ class GN_PT_windows(_PanelBase, Panel):
 # ===========================================================================
 _classes = (
     GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset, GN_IntProps,
-    GN_OT_set_exterior, GN_OT_add_floor_sel, GN_OT_add_floor_ground,
+    GN_OT_set_exterior, GN_OT_add_floor_sel,
+    GN_OT_add_floor_z, GN_OT_pick_floor_z,
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
@@ -1957,7 +2676,8 @@ _classes = (
 
 
 _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
-                  "cleanup", "partition", "reveal", "uid_counter", "uv_scale",
+                  "cleanup", "detail_tol", "bridge", "square", "ang_tol",
+                  "allow45", "partition", "reveal", "uid_counter", "uv_scale",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
                   "threshold_depth", "threshold_flip", "threshold_offset")
@@ -1971,7 +2691,8 @@ def _dump_scene(scene):
     data = {
         "settings": {k: getattr(s, k) for k in _SETTINGS_KEYS},
         "exterior": s.exterior.name if s.exterior else "",
-        "floors": [{"z": f.z, "top": f.top, "bound_json": f.bound_json} for f in s.floors],
+        "floors": [{"z": f.z, "top": f.top, "top_is_custom": f.top_is_custom,
+                    "bound_json": f.bound_json, "lock": f.lock} for f in s.floors],
         "rooms": [{"floor_index": r.floor_index, "uid": r.uid,
                    "poly_json": r.poly_json} for r in s.rooms],
         "openings": [{k: getattr(o, k) for k in
@@ -2015,6 +2736,8 @@ def _restore_scene(scene):
     for f in data.get("floors", []):
         it = s.floors.add()
         it.z = f["z"]; it.top = f["top"]; it.bound_json = f.get("bound_json", "")
+        it.top_is_custom = f.get("top_is_custom", False)
+        it.lock = f.get("lock", False)
     s.rooms.clear()
     for r in data.get("rooms", []):
         it = s.rooms.add()
