@@ -326,11 +326,13 @@ class GN_IntProps(PropertyGroup):
         description="Place a low floor strip across the bottom of each door opening",
         update=_cb_threshold)
     threshold_height: FloatProperty(name="Threshold Height", default=0.008,
-        min=0.0, max=0.05, unit='LENGTH', update=_cb_threshold)
+        min=0.0, max=0.3, unit='LENGTH', update=_cb_threshold)
     threshold_depth: FloatProperty(name="Threshold Depth", default=0.05,
         min=0.005, max=0.5, unit='LENGTH',
-        description="How far the threshold overhangs each side of the doorway",
+        description="How far the threshold reaches into the room from the doorway",
         update=_cb_threshold)
+    threshold_flip: BoolProperty(name="Flip Side", default=False,
+        description="Put the threshold in the other room", update=_cb_threshold)
     partition: FloatProperty(name="Partition Wall", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Gap left between two rooms when splitting "
         "(the interior partition wall thickness)")
@@ -618,10 +620,20 @@ def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     for f in bm.faces:                 # face inward
         f.normal_flip()
+    # put the object ORIGIN at the room's centre (of its bounds) instead of world 0
+    co = [v.co for v in bm.verts]
+    if co:
+        cx = (min(v.x for v in co) + max(v.x for v in co)) * 0.5
+        cy = (min(v.y for v in co) + max(v.y for v in co)) * 0.5
+        cz = (min(v.z for v in co) + max(v.z for v in co)) * 0.5
+        bmesh.ops.translate(bm, verts=bm.verts, vec=(-cx, -cy, -cz))
+    else:
+        cx = cy = cz = 0.0
     me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     bm.free()
     ob = bpy.data.objects.new(name, me)
+    ob.location = (cx, cy, cz)
     coll.objects.link(ob)
     return ob
 
@@ -706,7 +718,7 @@ def create_room(context, poly_xy, floor_idx):
     rec.uid = _new_uid(s)
     rec.poly_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in poly_xy])
     coll = _get_coll(ROOM_COLL)
-    ob = _build_shell(coll, f"GN_Room_F{floor_idx+1}_{rec.uid}", poly_xy, base, top,
+    ob = _build_shell(coll, f"r{len(s.rooms):02d}", poly_xy, base, top,
                       s.openings,
                       (s.wall_margin if s.reveal else 0.0),
                       (s.partition * 0.5 if s.reveal else 0.0))
@@ -727,7 +739,7 @@ def rebuild_rooms(context):
                 prev[u] = (ob.hide_get(), ob.hide_render, ob.hide_select)
     _clear_coll(ROOM_COLL)
     coll = _get_coll(ROOM_COLL)
-    for r in s.rooms:
+    for i, r in enumerate(s.rooms):
         if not r.uid:
             r.uid = _new_uid(s)
         fl = _floor_by_index(context, r.floor_index)
@@ -739,7 +751,7 @@ def rebuild_rooms(context):
         except Exception:
             continue
         if len(poly) >= 3:
-            ob = _build_shell(coll, f"GN_Room_F{r.floor_index+1}_{r.uid}", poly,
+            ob = _build_shell(coll, f"r{i+1:02d}", poly,
                               base, top, s.openings,
                               (s.wall_margin if s.reveal else 0.0),
                               (s.partition * 0.5 if s.reveal else 0.0))
@@ -750,6 +762,10 @@ def rebuild_rooms(context):
                 ob.hide_render = hr
                 ob.hide_select = hs
     _refresh_thresholds(context)              # door threshold strips
+    try:
+        context.view_layer.update()           # sync matrix_world for centred origins
+    except Exception:
+        pass
     _dump_scene(context.scene)                # keep the reload-survival backup current
 
 
@@ -1301,6 +1317,10 @@ def _frame_coll(kind):
 
 
 def _place_frame_mesh(op, mesh_src, width, height, kind):
+    """Instance a door/window frame mesh into the opening, oriented to the wall.
+    Detects the mesh's own axes from its bounding box (Z=height, the larger
+    horizontal extent=width, the smaller=depth), so any panel-like mesh orients
+    correctly regardless of how it was modelled. Origin-agnostic (uses bbox)."""
     if mesh_src is None or not mesh_src.data:
         return
     coll = _get_coll(_frame_coll(kind))
@@ -1311,18 +1331,39 @@ def _place_frame_mesh(op, mesh_src, width, height, kind):
         coll.objects.link(inst)
     else:
         inst.data = mesh_src.data
+    bb = [Vector(c) for c in mesh_src.bound_box]     # local-space corners
+    xs = [c.x for c in bb]; ys = [c.y for c in bb]; zs = [c.z for c in bb]
+    dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
+    cxl, cyl = (min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5
+    zbot = min(zs)
+
     n = Vector((op.nx, op.ny, 0.0)).normalized()
     along = Vector((-n.y, n.x, 0.0))
     up = Vector((0.0, 0.0, 1.0))
-    center = Vector((op.cx, op.cy, op.sill))    # mesh origin = bottom-centre
-    M = Matrix(((along.x, n.x, up.x, center.x),
-                (along.y, n.y, up.y, center.y),
-                (along.z, n.z, up.z, center.z),
-                (0.0, 0.0, 0.0, 1.0)))
-    dim = mesh_src.dimensions
-    sx = width / dim.x if dim.x > 1e-4 else 1.0
-    sz = height / dim.z if dim.z > 1e-4 else 1.0
-    inst.matrix_world = M @ Matrix.Diagonal((sx, 1.0, sz)).to_4x4()
+    sz = height / dz if dz > 1e-4 else 1.0
+    if dx >= dy:                                     # width = local X, depth = local Y
+        colX = along * (width / dx if dx > 1e-4 else 1.0)
+        colY = n
+    else:                                            # width = local Y, depth = local X
+        colX = n
+        colY = along * (width / dy if dy > 1e-4 else 1.0)
+    colZ = up * sz
+
+    def _mat(cX, cY, cZ):
+        return Matrix(((cX.x, cY.x, cZ.x, 0.0),
+                       (cX.y, cY.y, cZ.y, 0.0),
+                       (cX.z, cY.z, cZ.z, 0.0),
+                       (0.0, 0.0, 0.0, 1.0)))
+    R = _mat(colX, colY, colZ)
+    if R.to_3x3().determinant() < 0:                 # keep right-handed (no mirrored normals)
+        if dx >= dy:
+            colY = -colY
+        else:
+            colX = -colX
+        R = _mat(colX, colY, colZ)
+    # place bbox centre (width/depth) at the opening centre, bottom at the sill
+    R.translation = Vector((op.cx, op.cy, op.sill)) - R.to_3x3() @ Vector((cxl, cyl, zbot))
+    inst.matrix_world = R
 
 
 def _remove_frame_mesh(uid):
@@ -1340,32 +1381,46 @@ def _remove_threshold(uid):
 
 
 def _refresh_thresholds(context):
-    """Rebuild threshold strips for all door openings (or clear them if disabled)."""
+    """Rebuild threshold strips for all door openings (or clear them if disabled).
+    The strip sits inside ONE room (the side the door normal points to, flippable),
+    not bridging both. It spans from the gap centre into that room by threshold_depth."""
     s = context.scene.gn_int
     _clear_coll(THRESHOLD_COLL)
     if not s.add_threshold:
         return
     coll = _get_coll(THRESHOLD_COLL)
-    depth = s.partition + 2.0 * s.threshold_depth
     for op in s.openings:
         if not op.is_door:
             continue
         n = Vector((op.nx, op.ny, 0.0)).normalized()
+        if s.threshold_flip:
+            n = -n
         along = Vector((-n.y, n.x, 0.0))
         up = Vector((0.0, 0.0, 1.0))
-        center = Vector((op.cx, op.cy, op.sill + s.threshold_height * 0.5))
+        hw = op.hw
+        depth = max(s.threshold_depth, 1e-3)            # into the chosen room
+        h = max(s.threshold_height, 1e-4)
+        # build the box in LOCAL space so the object ORIGIN sits on the near-bottom
+        # EDGE (at the doorway), width centred, extending +Y into the room, +Z up
         bm = bmesh.new()
-        bmesh.ops.create_cube(bm, size=2.0)
+        vlo = [bm.verts.new((-hw, 0.0, 0.0)), bm.verts.new((hw, 0.0, 0.0)),
+               bm.verts.new((hw, depth, 0.0)), bm.verts.new((-hw, depth, 0.0))]
+        vhi = [bm.verts.new((v.co.x, v.co.y, h)) for v in vlo]
+        bm.faces.new(vlo)
+        bm.faces.new(vhi[::-1])
+        for k in range(4):
+            bm.faces.new((vlo[k], vlo[(k + 1) % 4], vhi[(k + 1) % 4], vhi[k]))
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
         me = bpy.data.meshes.new(f"GN_Threshold_{op.uid}")
         bm.to_mesh(me); bm.free()
         ob = bpy.data.objects.new(f"GN_Threshold_{op.uid}", me)
         coll.objects.link(ob)
-        M = Matrix(((along.x, n.x, up.x, center.x),
-                    (along.y, n.y, up.y, center.y),
-                    (along.z, n.z, up.z, center.z),
-                    (0.0, 0.0, 0.0, 1.0)))
-        ob.matrix_world = M @ Matrix.Diagonal(
-            (op.hw, depth * 0.5, max(s.threshold_height * 0.5, 1e-4))).to_4x4()
+        # orient: local X->along, Y->into room, Z->up; origin at the doorway/sill
+        ob.matrix_world = Matrix((
+            (along.x, n.x, up.x, op.cx),
+            (along.y, n.y, up.y, op.cy),
+            (along.z, n.z, up.z, op.sill),
+            (0.0, 0.0, 0.0, 1.0)))
 
 
 def add_opening(context, xy, normal, base, kind):
@@ -1666,6 +1721,7 @@ class GN_PT_interior(Panel):
             r = box.row(align=True)
             r.prop(s, "threshold_height", text="H")
             r.prop(s, "threshold_depth", text="D")
+            box.prop(s, "threshold_flip")
 
         box = layout.box()
         box.label(text="Windows:", icon='MESH_DATA')
@@ -1702,7 +1758,7 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
                   "cleanup", "partition", "reveal", "uid_counter",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
-                  "threshold_depth")
+                  "threshold_depth", "threshold_flip")
 
 
 def _dump_scene(scene):
