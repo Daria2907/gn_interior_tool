@@ -328,6 +328,10 @@ class GN_IntProps(PropertyGroup):
     uid_counter: IntProperty(default=1)
     openings: CollectionProperty(type=GN_Opening)
     opening_index: IntProperty(default=0, update=_cb_redraw)
+    opening_filter: EnumProperty(name="Filter", default='ALL',
+        items=[('ALL', "All", "Show all openings"),
+               ('DOOR', "Doors", "Show only doors"),
+               ('WINDOW', "Windows", "Show only windows")])
     reveal: BoolProperty(name="Reveal Jambs", default=True,
         description="Cap the opening sides so windows/doors have depth (the 20cm reveal)")
     door_presets: CollectionProperty(type=GN_DoorPreset)
@@ -1679,6 +1683,17 @@ class GN_UL_openings(bpy.types.UIList):
         op = row.operator("gn_int.remove_opening", text="", icon='X')
         op.index = index
 
+    def filter_items(self, ctx, data, propname):
+        items = getattr(data, propname)
+        flt = [self.bitflag_filter_item] * len(items)
+        mode = ctx.scene.gn_int.opening_filter
+        if mode != 'ALL':
+            want_door = (mode == 'DOOR')
+            for i, it in enumerate(items):
+                if it.is_door != want_door:
+                    flt[i] &= ~self.bitflag_filter_item
+        return flt, []
+
 
 class GN_UL_floors(bpy.types.UIList):
     def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
@@ -1770,6 +1785,7 @@ class GN_PT_openings(_PanelBase, Panel):
         layout.label(text="Select window/door pieces, then project", icon='INFO')
         if len(s.openings):
             layout.label(text=f"{len(s.openings)} opening(s) — X deletes one:")
+            layout.prop(s, "opening_filter", expand=True)
             layout.template_list("GN_UL_openings", "", s, "openings",
                                  s, "opening_index", rows=4)
         row = layout.row(align=True)
