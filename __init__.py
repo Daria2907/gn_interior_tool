@@ -291,6 +291,17 @@ def _cb_threshold(self, context):
         print("[GN Interior] threshold update:", e)
 
 
+def _cb_redraw(self, context):
+    """Redraw viewports so the selected-opening highlight updates."""
+    try:
+        for w in context.window_manager.windows:
+            for a in w.screen.areas:
+                if a.type == 'VIEW_3D':
+                    a.tag_redraw()
+    except Exception:
+        pass
+
+
 class GN_IntProps(PropertyGroup):
     exterior: PointerProperty(name="Exterior Shell", type=bpy.types.Object,
         description="The exterior building shell to read")
@@ -316,7 +327,7 @@ class GN_IntProps(PropertyGroup):
     room_index: IntProperty(default=0)
     uid_counter: IntProperty(default=1)
     openings: CollectionProperty(type=GN_Opening)
-    opening_index: IntProperty(default=0)
+    opening_index: IntProperty(default=0, update=_cb_redraw)
     reveal: BoolProperty(name="Reveal Jambs", default=True,
         description="Cap the opening sides so windows/doors have depth (the 20cm reveal)")
     door_presets: CollectionProperty(type=GN_DoorPreset)
@@ -333,7 +344,10 @@ class GN_IntProps(PropertyGroup):
         description="How far the threshold reaches into the room from the doorway",
         update=_cb_threshold)
     threshold_flip: BoolProperty(name="Flip Side", default=False,
-        description="Put the threshold in the other room", update=_cb_threshold)
+        description="Reverse the direction the threshold extends / the normal", update=_cb_threshold)
+    threshold_offset: FloatProperty(name="Offset", default=0.0, min=-0.5, max=0.5,
+        unit='LENGTH', description="Slide the threshold (and its pivot) across the "
+        "doorway. 0 = door line; negative = toward the next room", update=_cb_threshold)
     partition: FloatProperty(name="Partition Wall", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Gap left between two rooms when splitting "
         "(the interior partition wall thickness)")
@@ -1403,10 +1417,11 @@ def _refresh_thresholds(context):
         lip = max(s.threshold_depth, 0.0)               # extra reach into this room past the gap
         depth = gap + lip
         h = max(s.threshold_height, 1e-4)
-        # ORIGIN sits on the FAR edge of the frame (the wall of the next room);
+        # ORIGIN starts on the FAR edge (next room's wall) + the user Offset nudge;
         # the strip spans +Y across the gap and a lip into this room.
-        ox = op.cx - n.x * gap
-        oy = op.cy - n.y * gap
+        off = s.threshold_offset
+        ox = op.cx - n.x * gap + n.x * off
+        oy = op.cy - n.y * gap + n.y * off
         bm = bmesh.new()
         vlo = [bm.verts.new((-hw, 0.0, 0.0)), bm.verts.new((hw, 0.0, 0.0)),
                bm.verts.new((hw, depth, 0.0)), bm.verts.new((-hw, depth, 0.0))]
@@ -1792,7 +1807,9 @@ class GN_PT_doors(_PanelBase, Panel):
             r = layout.row(align=True)
             r.prop(s, "threshold_height", text="H")
             r.prop(s, "threshold_depth", text="D")
-            layout.prop(s, "threshold_flip")
+            r = layout.row(align=True)
+            r.prop(s, "threshold_offset")
+            r.prop(s, "threshold_flip", toggle=True)
 
 
 class GN_PT_windows(_PanelBase, Panel):
@@ -1838,7 +1855,7 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
                   "cleanup", "partition", "reveal", "uid_counter",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
-                  "threshold_depth", "threshold_flip")
+                  "threshold_depth", "threshold_flip", "threshold_offset")
 
 
 def _dump_scene(scene):
@@ -1922,6 +1939,35 @@ def _restore_scene(scene):
             it.mesh_object = bpy.data.objects[mn]
 
 
+_HL_HANDLE = None
+
+
+def _draw_opening_highlight():
+    """Persistent overlay: outline the opening currently selected in the list."""
+    try:
+        s = bpy.context.scene.gn_int
+        if not (0 <= s.opening_index < len(s.openings)):
+            return
+        op = s.openings[s.opening_index]
+        n = Vector((op.nx, op.ny))
+        along = Vector((-n.y, n.x))
+        c = Vector((op.cx, op.cy))
+        a = c - along * op.hw
+        b = c + along * op.hw
+        z0, z1 = op.sill, op.top
+        pts = [(a.x, a.y, z0), (b.x, b.y, z0), (b.x, b.y, z1), (a.x, a.y, z1)]
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.line_width_set(3.0)
+        batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": pts})
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.85, 0.1, 1.0))
+        batch.draw(shader)
+        gpu.state.line_width_set(1.0)
+    except Exception:
+        pass
+
+
 def _deferred_restore():
     # runs after enable completes (bpy.data is accessible here, unlike register())
     for scene in bpy.data.scenes:
@@ -1935,13 +1981,24 @@ def _deferred_restore():
 
 
 def register():
+    global _HL_HANDLE
     for c in _classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.gn_int = PointerProperty(type=GN_IntProps)
     bpy.app.timers.register(_deferred_restore, first_interval=0.0)
+    if _HL_HANDLE is None:
+        _HL_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_opening_highlight, (), 'WINDOW', 'POST_VIEW')
 
 
 def unregister():
+    global _HL_HANDLE
+    if _HL_HANDLE is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_HL_HANDLE, 'WINDOW')
+        except Exception:
+            pass
+        _HL_HANDLE = None
     try:
         for scene in bpy.data.scenes:           # best-effort backup before delete
             _dump_scene(scene)
