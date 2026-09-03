@@ -1647,63 +1647,95 @@ class GN_UL_floors(bpy.types.UIList):
         op.index = index
 
 
-class GN_PT_interior(Panel):
+class _PanelBase:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "GN Interior"
+
+
+class GN_PT_interior(_PanelBase, Panel):
     bl_label = "Interior Tool"
 
     def draw(self, context):
         s = context.scene.gn_int
-        layout = self.layout
-
-        box = layout.box()
-        row = box.row(align=True)
+        row = self.layout.row(align=True)
         row.prop(s, "exterior", text="Shell")
         row.operator("gn_int.set_exterior", text="", icon='EYEDROPPER')
 
-        col = layout.column(align=True)
+
+class GN_PT_setup(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Setup"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        col = self.layout.column(align=True)
         col.prop(s, "wall_margin")
         col.prop(s, "room_height")
         col.prop(s, "floor_gap")
         col.prop(s, "sample_offset")
         col.prop(s, "cleanup")
 
-        box = layout.box()
-        box.label(text="Floor levels:", icon='ALIGN_JUSTIFY')
-        box.template_list("GN_UL_floors", "", s, "floors", s, "floor_index", rows=3)
-        r = box.row(align=True)
+
+class GN_PT_floors(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Floors & Boundaries"
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        layout.template_list("GN_UL_floors", "", s, "floors", s, "floor_index", rows=3)
+        r = layout.row(align=True)
         r.operator("gn_int.add_floor_ground", icon='TRIA_DOWN_BAR')
         r.operator("gn_int.add_floor_sel", text="From Edge", icon='EDGESEL')
-
-        layout.separator()
         layout.operator("gn_int.gen_boundaries", icon='MESH_GRID')
         layout.operator("gn_int.clear", icon='TRASH')
 
-        box = layout.box()
-        box.label(text="Rooms:", icon='MOD_BUILD')
-        row = box.row(align=True)
+
+class GN_PT_rooms(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Rooms"
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        row = layout.row(align=True)
         row.prop(s, "active_floor")
         row.prop(s, "snap")
-        box.prop(s, "partition")
-        box.operator("gn_int.seed_rooms", icon='MESH_PLANE')
-        box.operator("gn_int.split_edges", icon='MOD_BEVEL')
-        box.label(text="Edit Mode: pick 2 wall edges, then Split", icon='INFO')
-        box.label(text=f"{len(s.rooms)} room(s)")
-        row = box.row(align=True)
+        layout.prop(s, "partition")
+        layout.operator("gn_int.seed_rooms", icon='MESH_PLANE')
+        layout.operator("gn_int.split_edges", icon='MOD_BEVEL')
+        layout.label(text="Edit Mode: pick 2 wall edges, then Split", icon='INFO')
+        layout.label(text=f"{len(s.rooms)} room(s)")
+        row = layout.row(align=True)
         row.operator("gn_int.rebuild_rooms", icon='FILE_REFRESH')
         row.operator("gn_int.clear_rooms", icon='TRASH')
 
-        box = layout.box()
-        box.label(text="Openings:", icon='MOD_BOOLEAN')
-        box.prop(s, "reveal")
-        box.operator("gn_int.project_openings", icon='SELECT_DIFFERENCE')
-        box.label(text="Select window/door pieces, then project", icon='INFO')
-        box.operator("gn_int.clear_openings", icon='TRASH')
 
-        box = layout.box()
-        box.label(text="Doors (between rooms):", icon='MESH_DATA')
-        row = box.row()
+class GN_PT_openings(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Openings (project)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        layout.prop(s, "reveal")
+        layout.operator("gn_int.project_openings", icon='SELECT_DIFFERENCE')
+        layout.label(text="Select window/door pieces, then project", icon='INFO')
+        layout.operator("gn_int.clear_openings", icon='TRASH')
+
+
+class GN_PT_doors(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Doors"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        row = layout.row()
         row.template_list("GN_UL_door_presets", "doors", s, "door_presets",
                           s, "active_door_preset", rows=2)
         col = row.column(align=True)
@@ -1711,21 +1743,28 @@ class GN_PT_interior(Panel):
         col.operator("gn_int.preset_remove", text="", icon='REMOVE').kind = 'DOOR'
         if 0 <= s.active_door_preset < len(s.door_presets):
             dp = s.door_presets[s.active_door_preset]
-            box.prop(dp, "width")
-            box.prop(dp, "height")
-            box.prop(dp, "mesh_object")
-        box.operator("gn_int.opening_edit", text="Door Edit Mode",
-                     icon='GREASEPENCIL').kind = 'DOOR'
-        box.prop(s, "add_threshold")
+            layout.prop(dp, "width")
+            layout.prop(dp, "height")
+            layout.prop(dp, "mesh_object")
+        layout.operator("gn_int.opening_edit", text="Door Edit Mode",
+                        icon='GREASEPENCIL').kind = 'DOOR'
+        layout.prop(s, "add_threshold")
         if s.add_threshold:
-            r = box.row(align=True)
+            r = layout.row(align=True)
             r.prop(s, "threshold_height", text="H")
             r.prop(s, "threshold_depth", text="D")
-            box.prop(s, "threshold_flip")
+            layout.prop(s, "threshold_flip")
 
-        box = layout.box()
-        box.label(text="Windows:", icon='MESH_DATA')
-        row = box.row()
+
+class GN_PT_windows(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Windows"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        row = layout.row()
         row.template_list("GN_UL_door_presets", "wins", s, "window_presets",
                           s, "active_window_preset", rows=2)
         col = row.column(align=True)
@@ -1733,12 +1772,12 @@ class GN_PT_interior(Panel):
         col.operator("gn_int.preset_remove", text="", icon='REMOVE').kind = 'WINDOW'
         if 0 <= s.active_window_preset < len(s.window_presets):
             wp = s.window_presets[s.active_window_preset]
-            box.prop(wp, "width")
-            box.prop(wp, "height")
-            box.prop(wp, "sill")
-            box.prop(wp, "mesh_object")
-        box.operator("gn_int.opening_edit", text="Window Edit Mode",
-                     icon='GREASEPENCIL').kind = 'WINDOW'
+            layout.prop(wp, "width")
+            layout.prop(wp, "height")
+            layout.prop(wp, "sill")
+            layout.prop(wp, "mesh_object")
+        layout.operator("gn_int.opening_edit", text="Window Edit Mode",
+                        icon='GREASEPENCIL').kind = 'WINDOW'
 
 
 # ===========================================================================
@@ -1750,7 +1789,9 @@ _classes = (
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove,
-    GN_UL_door_presets, GN_UL_floors, GN_PT_interior,
+    GN_UL_door_presets, GN_UL_floors,
+    GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
+    GN_PT_openings, GN_PT_doors, GN_PT_windows,
 )
 
 
