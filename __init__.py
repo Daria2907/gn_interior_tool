@@ -318,6 +318,9 @@ class GN_IntProps(PropertyGroup):
     cleanup: FloatProperty(name="Cleanup", default=0.08, min=0.0, max=0.5,
         unit='LENGTH', description="Simplify the outline: remove wiggles/slivers "
         "smaller than this (metres). Keeps real corners. 0 = exact outline")
+    uv_scale: FloatProperty(name="UV Scale", default=2.0, min=0.05, max=20.0,
+        unit='LENGTH', description="Cube-UV texture size: a texture tiles every "
+        "this many metres")
     floors: CollectionProperty(type=GN_FloorLevel)
     floor_index: IntProperty(default=0)
     active_floor: IntProperty(name="Draw on Floor", default=0, min=0,
@@ -533,6 +536,52 @@ def _make_loop_object(coll, name, poly_xy, z):
     return ob
 
 
+# surface material slots (index order used by _build_wall / _build_shell)
+_SURF_MATS = (("GN_Wall", (0.62, 0.62, 0.62, 1.0)),      # 0
+              ("GN_Floor", (0.55, 0.45, 0.35, 1.0)),     # 1
+              ("GN_Ceiling", (0.85, 0.85, 0.85, 1.0)),   # 2
+              ("GN_Reveal", (0.40, 0.40, 0.42, 1.0)))    # 3
+MAT_WALL, MAT_FLOOR, MAT_CEIL, MAT_REVEAL = 0, 1, 2, 3
+
+
+def _get_mat(name, color):
+    m = bpy.data.materials.get(name)
+    if m is None:
+        m = bpy.data.materials.new(name)
+        m.diffuse_color = color
+        m.use_nodes = True
+        try:
+            m.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = color
+        except Exception:
+            pass
+    return m
+
+
+def _assign_surface_materials(ob):
+    ob.data.materials.clear()
+    for name, color in _SURF_MATS:
+        ob.data.materials.append(_get_mat(name, color))
+
+
+def _box_uv(bm, scale, matrix=None):
+    """World-scale cube/box projection: each face is projected onto the axis-plane
+    it faces, so a `scale`-metre texture tiles every `scale` metres everywhere."""
+    scale = max(scale, 1e-4)
+    uvl = bm.loops.layers.uv.verify()
+    for f in bm.faces:
+        nrm = f.normal
+        ax = max(range(3), key=lambda i: abs(nrm[i]))   # dominant axis
+        for loop in f.loops:
+            co = loop.vert.co if matrix is None else (matrix @ loop.vert.co)
+            if ax == 2:
+                u, v = co.x, co.y
+            elif ax == 0:
+                u, v = co.y, co.z
+            else:
+                u, v = co.x, co.z
+            loop[uvl].uv = (u / scale, v / scale)
+
+
 def _wall_spans(A, B, base_z, ceil_z, openings, win_reveal=0.0, door_reveal=0.0):
     """Return (d, L, wn, spans) for wall A->B; spans = (x0,x1,z0,z1,reveal)."""
     d = B - A
@@ -583,8 +632,9 @@ def _build_wall(bm, A, B, base_z, ceil_z, openings, win_reveal, door_reveal):
         for j in range(len(zs) - 1):
             if in_hole((xs[i] + xs[i + 1]) * 0.5, (zs[j] + zs[j + 1]) * 0.5):
                 continue
-            bm.faces.new((W(xs[i], zs[j]), W(xs[i + 1], zs[j]),
-                          W(xs[i + 1], zs[j + 1]), W(xs[i], zs[j + 1])))
+            f = bm.faces.new((W(xs[i], zs[j]), W(xs[i + 1], zs[j]),
+                              W(xs[i + 1], zs[j + 1]), W(xs[i], zs[j + 1])))
+            f.material_index = MAT_WALL
     # reveal jambs: extrude each opening's rim outward by its own reveal depth
     for (x0, x1, z0, z1, rd) in spans:
         if rd <= 1e-4:
@@ -597,14 +647,15 @@ def _build_wall(bm, A, B, base_z, ceil_z, openings, win_reveal, door_reveal):
                 bx += o.x
                 by += o.y
             return bm.verts.new((bx, by, z))
-        bm.faces.new((P(x0, z0, 0), P(x1, z0, 0), P(x1, z0, 1), P(x0, z0, 1)))  # bottom
-        bm.faces.new((P(x0, z1, 0), P(x1, z1, 0), P(x1, z1, 1), P(x0, z1, 1)))  # top
-        bm.faces.new((P(x0, z0, 0), P(x0, z1, 0), P(x0, z1, 1), P(x0, z0, 1)))  # left
-        bm.faces.new((P(x1, z0, 0), P(x1, z1, 0), P(x1, z1, 1), P(x1, z0, 1)))  # right
+        for quad in ((P(x0, z0, 0), P(x1, z0, 0), P(x1, z0, 1), P(x0, z0, 1)),   # bottom
+                     (P(x0, z1, 0), P(x1, z1, 0), P(x1, z1, 1), P(x0, z1, 1)),   # top
+                     (P(x0, z0, 0), P(x0, z1, 0), P(x0, z1, 1), P(x0, z0, 1)),   # left
+                     (P(x1, z0, 0), P(x1, z1, 0), P(x1, z1, 1), P(x1, z0, 1))):  # right
+            bm.faces.new(quad).material_index = MAT_REVEAL
 
 
 def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
-                 win_reveal=0.0, door_reveal=0.0):
+                 win_reveal=0.0, door_reveal=0.0, uv_scale=2.0):
     bm = bmesh.new()
     n = len(poly_xy)
     # floor/ceiling loops carry the opening cut points too, so their edges weld to the
@@ -626,11 +677,11 @@ def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
     fv = [bm.verts.new(p) for p in floor_loop]
     cv = [bm.verts.new(p) for p in ceil_loop]
     try:
-        bm.faces.new(fv)               # floor
+        bm.faces.new(fv).material_index = MAT_FLOOR
     except ValueError:
         pass
     try:
-        bm.faces.new(cv[::-1])         # ceiling
+        bm.faces.new(cv[::-1]).material_index = MAT_CEIL
     except ValueError:
         pass
     for k in range(n):
@@ -640,6 +691,7 @@ def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     for f in bm.faces:                 # face inward
         f.normal_flip()
+    _box_uv(bm, uv_scale)              # world-scale cube UVs (verts still in world coords)
     # put the object ORIGIN at the room's centre (of its bounds) instead of world 0
     co = [v.co for v in bm.verts]
     if co:
@@ -650,6 +702,8 @@ def _build_shell(coll, name, poly_xy, base_z, ceil_z, openings=None,
     else:
         cx = cy = cz = 0.0
     me = bpy.data.meshes.new(name)
+    for name_col in _SURF_MATS:            # slots present BEFORE to_mesh so indices stay valid
+        me.materials.append(_get_mat(name_col[0], name_col[1]))
     bm.to_mesh(me)
     bm.free()
     ob = bpy.data.objects.new(name, me)
@@ -741,7 +795,7 @@ def create_room(context, poly_xy, floor_idx):
     ob = _build_shell(coll, f"r{len(s.rooms):02d}", poly_xy, base, top,
                       s.openings,
                       (s.wall_margin if s.reveal else 0.0),
-                      (s.partition * 0.5 if s.reveal else 0.0))
+                      (s.partition * 0.5 if s.reveal else 0.0), s.uv_scale)
     ob["gn_room_uid"] = rec.uid
     return rec
 
@@ -774,7 +828,7 @@ def rebuild_rooms(context):
             ob = _build_shell(coll, f"r{i+1:02d}", poly,
                               base, top, s.openings,
                               (s.wall_margin if s.reveal else 0.0),
-                              (s.partition * 0.5 if s.reveal else 0.0))
+                              (s.partition * 0.5 if s.reveal else 0.0), s.uv_scale)
             ob["gn_room_uid"] = r.uid
             if r.uid in prev:                 # restore visibility
                 hv, hr, hs = prev[r.uid]
@@ -1024,6 +1078,32 @@ class GN_OT_rebuild_rooms(Operator):
 
     def execute(self, context):
         rebuild_rooms(context)
+        return {'FINISHED'}
+
+
+class GN_OT_reunwrap(Operator):
+    bl_idname = "gn_int.reunwrap"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Re-Cube-Unwrap"
+    bl_description = ("Box-project world-scale UVs onto the selected room meshes "
+                      "(or all rooms) — run after resizing to fix UVs")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        rooms = bpy.data.collections.get(ROOM_COLL)
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets and rooms:
+            targets = list(rooms.objects)
+        n = 0
+        for ob in targets:
+            bm = bmesh.new()
+            bm.from_mesh(ob.data)
+            _box_uv(bm, s.uv_scale, ob.matrix_world)   # world coords -> tiling survives scaling
+            bm.to_mesh(ob.data)
+            bm.free()
+            ob.data.update()
+            n += 1
+        self.report({'INFO'}, f"Re-unwrapped {n} object(s)")
         return {'FINISHED'}
 
 
@@ -1748,6 +1828,7 @@ class GN_PT_setup(_PanelBase, Panel):
         col.prop(s, "floor_gap")
         col.prop(s, "sample_offset")
         col.prop(s, "cleanup")
+        col.prop(s, "uv_scale")
 
 
 class GN_PT_floors(_PanelBase, Panel):
@@ -1783,6 +1864,7 @@ class GN_PT_rooms(_PanelBase, Panel):
         row = layout.row(align=True)
         row.operator("gn_int.rebuild_rooms", icon='FILE_REFRESH')
         row.operator("gn_int.clear_rooms", icon='TRASH')
+        layout.operator("gn_int.reunwrap", icon='UV')
 
 
 class GN_PT_openings(_PanelBase, Panel):
@@ -1865,6 +1947,7 @@ _classes = (
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
+    GN_OT_reunwrap,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors,
@@ -1874,7 +1957,7 @@ _classes = (
 
 
 _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
-                  "cleanup", "partition", "reveal", "uid_counter",
+                  "cleanup", "partition", "reveal", "uid_counter", "uv_scale",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
                   "threshold_depth", "threshold_flip", "threshold_offset")
