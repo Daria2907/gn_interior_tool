@@ -258,6 +258,7 @@ class GN_Opening(PropertyGroup):
     top: FloatProperty()    # top Z
     uid: IntProperty(default=0)
     is_door: BoolProperty(default=False)
+    projected: BoolProperty(default=False)   # from an exterior piece (no threshold)
 
 
 class GN_DoorPreset(PropertyGroup):
@@ -1284,6 +1285,7 @@ class GN_OT_project_openings(Operator):
             op.hw = hw + 0.01
             op.sill = sill
             op.top = top
+            op.projected = True             # exterior piece -> no threshold
             # a piece that reaches (near) a floor is a door; otherwise a window
             op.is_door = any(abs(sill - fb) < 0.3 for fb in floor_bases)
             made += 1
@@ -1420,7 +1422,7 @@ def _refresh_thresholds(context):
         return
     coll = _get_coll(THRESHOLD_COLL)
     for op in s.openings:
-        if not op.is_door:
+        if not op.is_door or op.projected:      # only interior doors get a threshold
             continue
         n = Vector((op.nx, op.ny, 0.0)).normalized()   # points into the room it was placed in
         along = Vector((-n.y, n.x, 0.0))
@@ -1890,7 +1892,8 @@ def _dump_scene(scene):
         "rooms": [{"floor_index": r.floor_index, "uid": r.uid,
                    "poly_json": r.poly_json} for r in s.rooms],
         "openings": [{k: getattr(o, k) for k in
-                      ("cx", "cy", "nx", "ny", "hw", "sill", "top", "uid", "is_door")}
+                      ("cx", "cy", "nx", "ny", "hw", "sill", "top", "uid",
+                       "is_door", "projected")}
                      for o in s.openings],
         "door_presets": [{"name": p.name, "width": p.width, "height": p.height,
                           "mesh": p.mesh_object.name if p.mesh_object else ""}
