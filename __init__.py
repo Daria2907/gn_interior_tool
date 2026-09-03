@@ -1392,16 +1392,20 @@ def _refresh_thresholds(context):
     for op in s.openings:
         if not op.is_door:
             continue
-        n = Vector((op.nx, op.ny, 0.0)).normalized()
+        n = Vector((op.nx, op.ny, 0.0)).normalized()   # points into the room it was placed in
         if s.threshold_flip:
             n = -n
         along = Vector((-n.y, n.x, 0.0))
         up = Vector((0.0, 0.0, 1.0))
         hw = op.hw
-        depth = max(s.threshold_depth, 1e-3)            # into the chosen room
+        gap = max(s.partition, 0.0)                     # distance across the doorway to the next room
+        lip = max(s.threshold_depth, 0.0)               # extra reach into this room past the gap
+        depth = gap + lip
         h = max(s.threshold_height, 1e-4)
-        # build the box in LOCAL space so the object ORIGIN sits on the near-bottom
-        # EDGE (at the doorway), width centred, extending +Y into the room, +Z up
+        # ORIGIN sits on the FAR edge of the frame (the wall of the next room);
+        # the strip spans +Y across the gap and a lip into this room.
+        ox = op.cx - n.x * gap
+        oy = op.cy - n.y * gap
         bm = bmesh.new()
         vlo = [bm.verts.new((-hw, 0.0, 0.0)), bm.verts.new((hw, 0.0, 0.0)),
                bm.verts.new((hw, depth, 0.0)), bm.verts.new((-hw, depth, 0.0))]
@@ -1415,10 +1419,9 @@ def _refresh_thresholds(context):
         bm.to_mesh(me); bm.free()
         ob = bpy.data.objects.new(f"GN_Threshold_{op.uid}", me)
         coll.objects.link(ob)
-        # orient: local X->along, Y->into room, Z->up; origin at the doorway/sill
         ob.matrix_world = Matrix((
-            (along.x, n.x, up.x, op.cx),
-            (along.y, n.y, up.y, op.cy),
+            (along.x, n.x, up.x, ox),
+            (along.y, n.y, up.y, oy),
             (along.z, n.z, up.z, op.sill),
             (0.0, 0.0, 0.0, 1.0)))
 
