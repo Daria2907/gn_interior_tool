@@ -1251,9 +1251,9 @@ def _piece_frame(obj):
 class GN_OT_project_openings(Operator):
     bl_idname = "gn_int.project_openings"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Project Openings"
-    bl_description = ("Cut openings into the room walls from the selected window/door "
-                      "pieces (planes or meshes). Openings survive room splits")
+    bl_label = "Project Selected Pieces"
+    bl_description = ("Cut openings into the room walls from the SELECTED window/door "
+                      "pieces only (planes or meshes). Additive; skips duplicates")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -1262,25 +1262,36 @@ class GN_OT_project_openings(Operator):
         pieces = [o for o in context.selected_objects
                   if o.type == 'MESH' and o not in room_objs]
         if not pieces:
-            self.report({'ERROR'}, "Select the separated window/door pieces first")
+            self.report({'ERROR'}, "Select the window/door pieces to project first")
             return {'CANCELLED'}
-        made = 0
+        floor_bases = [b for (b, _t, _n) in _floor_tops(context)]
+        made = skipped = 0
         for o in pieces:
             fr = _piece_frame(o)
             if not fr:
                 continue
             center, u, v, n, hw, hh = fr
+            sill, top = center.z - hh, center.z + hh
+            # skip if an opening already exists at ~this spot (avoid duplicates)
+            if any(abs(e.cx - center.x) < 0.1 and abs(e.cy - center.y) < 0.1
+                   and abs(e.sill - sill) < 0.15 for e in s.openings):
+                skipped += 1
+                continue
             op = s.openings.add()
-            op.cx = center.x
-            op.cy = center.y
-            op.nx = n.x
-            op.ny = n.y
+            op.uid = _new_uid(s)
+            op.cx, op.cy = center.x, center.y
+            op.nx, op.ny = n.x, n.y
             op.hw = hw + 0.01
-            op.sill = center.z - hh
-            op.top = center.z + hh
+            op.sill = sill
+            op.top = top
+            # a piece that reaches (near) a floor is a door; otherwise a window
+            op.is_door = any(abs(sill - fb) < 0.3 for fb in floor_bases)
             made += 1
         rebuild_rooms(context)
-        self.report({'INFO'}, f"Projected {made} opening(s) into the rooms")
+        msg = f"Projected {made} selected opening(s)"
+        if skipped:
+            msg += f" ({skipped} already existed)"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
