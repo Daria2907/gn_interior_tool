@@ -1412,15 +1412,15 @@ def _refresh_thresholds(context):
         up = Vector((0.0, 0.0, 1.0))
         hw = op.hw
         gap = max(s.partition, 0.0)                     # distance across the doorway
-        lip = max(s.threshold_depth, 0.0)               # extra reach into each room
-        half = gap * 0.5 + lip
+        depth = gap * 0.5 + max(s.threshold_depth, 0.0)  # from the boundary into the room
         h = max(s.threshold_height, 1e-4)
-        # ORIGIN sits where the two rooms meet: the centre of the gap between them.
+        # ORIGIN sits on the boundary where the two rooms meet (centre of the gap);
+        # the strip lies on ONE side of it, so the pivot is on the strip's EDGE.
         ox = op.cx - n.x * (gap * 0.5)
         oy = op.cy - n.y * (gap * 0.5)
         bm = bmesh.new()
-        vlo = [bm.verts.new((-hw, -half, 0.0)), bm.verts.new((hw, -half, 0.0)),
-               bm.verts.new((hw, half, 0.0)), bm.verts.new((-hw, half, 0.0))]
+        vlo = [bm.verts.new((-hw, 0.0, 0.0)), bm.verts.new((hw, 0.0, 0.0)),
+               bm.verts.new((hw, depth, 0.0)), bm.verts.new((-hw, depth, 0.0))]
         vhi = [bm.verts.new((v.co.x, v.co.y, h)) for v in vlo]
         bm.faces.new(vlo)
         bm.faces.new(vhi[::-1])
