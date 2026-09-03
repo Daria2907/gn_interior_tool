@@ -35,7 +35,7 @@ from bpy_extras import view3d_utils
 from mathutils import Vector, Matrix
 from mathutils.geometry import intersect_line_plane
 from bpy.props import (FloatProperty, IntProperty, StringProperty, BoolProperty,
-                       PointerProperty, CollectionProperty)
+                       PointerProperty, CollectionProperty, EnumProperty)
 from bpy.types import Operator, Panel, PropertyGroup
 
 BOUND_COLL = "GN_Boundaries"
@@ -43,6 +43,8 @@ INT_COLL = "GN_Interiors"
 ROOM_COLL = "GN_Rooms"
 CUTTER_COLL = "GN_Cutters"
 DOORFRAME_COLL = "GN_DoorFrames"
+WINDOWFRAME_COLL = "GN_WindowFrames"
+THRESHOLD_COLL = "GN_Thresholds"
 
 
 # ===========================================================================
@@ -266,6 +268,16 @@ class GN_DoorPreset(PropertyGroup):
         description="Optional door mesh placed as a linked instance at each opening")
 
 
+class GN_WindowPreset(PropertyGroup):
+    name: StringProperty(default="Window")
+    width: FloatProperty(name="Width", default=1.0, min=0.2, max=6.0, unit='LENGTH')
+    height: FloatProperty(name="Height", default=1.2, min=0.2, max=5.0, unit='LENGTH')
+    sill: FloatProperty(name="Sill Height", default=0.9, min=0.0, max=4.0, unit='LENGTH',
+        description="Height of the window bottom above the floor")
+    mesh_object: PointerProperty(name="Frame Mesh", type=bpy.types.Object,
+        description="Optional window mesh placed as a linked instance at each opening")
+
+
 class GN_IntProps(PropertyGroup):
     exterior: PointerProperty(name="Exterior Shell", type=bpy.types.Object,
         description="The exterior building shell to read")
@@ -295,6 +307,15 @@ class GN_IntProps(PropertyGroup):
         description="Cap the opening sides so windows/doors have depth (the 20cm reveal)")
     door_presets: CollectionProperty(type=GN_DoorPreset)
     active_door_preset: IntProperty(default=0)
+    window_presets: CollectionProperty(type=GN_WindowPreset)
+    active_window_preset: IntProperty(default=0)
+    add_threshold: BoolProperty(name="Door Threshold", default=False,
+        description="Place a low floor strip across the bottom of each door opening")
+    threshold_height: FloatProperty(name="Threshold Height", default=0.008,
+        min=0.0, max=0.05, unit='LENGTH')
+    threshold_depth: FloatProperty(name="Threshold Depth", default=0.05,
+        min=0.005, max=0.5, unit='LENGTH',
+        description="How far the threshold overhangs each side of the doorway")
     partition: FloatProperty(name="Partition Wall", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Gap left between two rooms when splitting "
         "(the interior partition wall thickness)")
@@ -713,6 +734,7 @@ def rebuild_rooms(context):
                 ob.hide_set(hv)
                 ob.hide_render = hr
                 ob.hide_select = hs
+    _refresh_thresholds(context)              # door threshold strips
     _dump_scene(context.scene)                # keep the reload-survival backup current
 
 
@@ -1220,6 +1242,8 @@ class GN_OT_clear_openings(Operator):
     def execute(self, context):
         context.scene.gn_int.openings.clear()
         _clear_coll(DOORFRAME_COLL)
+        _clear_coll(WINDOWFRAME_COLL)
+        _clear_coll(THRESHOLD_COLL)
         rebuild_rooms(context)
         return {'FINISHED'}
 
@@ -1227,37 +1251,45 @@ class GN_OT_clear_openings(Operator):
 # ===========================================================================
 # doors (Room-Tool-style edit mode)
 # ===========================================================================
-def _active_door(s):
-    """Return (width, height, mesh_object) from the active door preset."""
-    if 0 <= s.active_door_preset < len(s.door_presets):
-        p = s.door_presets[s.active_door_preset]
-        return p.width, p.height, p.mesh_object
-    return 0.9, 2.0, None
+def _active_preset(s, kind):
+    """Return (width, height, sill, mesh_object) for the active door/window preset."""
+    if kind == 'DOOR':
+        if 0 <= s.active_door_preset < len(s.door_presets):
+            p = s.door_presets[s.active_door_preset]
+            return p.width, p.height, 0.0, p.mesh_object
+        return 0.9, 2.0, 0.0, None
+    if 0 <= s.active_window_preset < len(s.window_presets):
+        p = s.window_presets[s.active_window_preset]
+        return p.width, p.height, p.sill, p.mesh_object
+    return 1.0, 1.2, 0.9, None
 
 
 def _room_base(obj):
     return min((v.co.z for v in obj.data.vertices), default=0.0)
 
 
-def _door_under(s, xy, z):
+def _opening_under(s, xy, z, want_door):
     for i, op in enumerate(s.openings):
-        if not op.is_door:
+        if op.is_door != want_door:
             continue
-        c = Vector((op.cx, op.cy))
         n = Vector((op.nx, op.ny))
         along = Vector((-n.y, n.x))
-        d = xy - c
+        d = xy - Vector((op.cx, op.cy))
         if abs(d.dot(along)) < op.hw and abs(d.dot(n)) < 0.35 and \
            op.sill - 0.05 < z < op.top + 0.05:
             return i
     return -1
 
 
-def _place_door_mesh(op, mesh_src, width, height, base):
+def _frame_coll(kind):
+    return DOORFRAME_COLL if kind == 'DOOR' else WINDOWFRAME_COLL
+
+
+def _place_frame_mesh(op, mesh_src, width, height, kind):
     if mesh_src is None or not mesh_src.data:
         return
-    coll = _get_coll(DOORFRAME_COLL)
-    name = f"GN_DoorFrame_{op.uid}"
+    coll = _get_coll(_frame_coll(kind))
+    name = f"GN_Frame_{op.uid}"
     inst = bpy.data.objects.get(name)
     if inst is None:
         inst = bpy.data.objects.new(name, mesh_src.data)
@@ -1267,7 +1299,7 @@ def _place_door_mesh(op, mesh_src, width, height, base):
     n = Vector((op.nx, op.ny, 0.0)).normalized()
     along = Vector((-n.y, n.x, 0.0))
     up = Vector((0.0, 0.0, 1.0))
-    center = Vector((op.cx, op.cy, base))
+    center = Vector((op.cx, op.cy, op.sill))    # mesh origin = bottom-centre
     M = Matrix(((along.x, n.x, up.x, center.x),
                 (along.y, n.y, up.y, center.y),
                 (along.z, n.z, up.z, center.z),
@@ -1278,30 +1310,69 @@ def _place_door_mesh(op, mesh_src, width, height, base):
     inst.matrix_world = M @ Matrix.Diagonal((sx, 1.0, sz)).to_4x4()
 
 
-def _remove_door_mesh(uid):
-    inst = bpy.data.objects.get(f"GN_DoorFrame_{uid}")
-    if inst:
-        bpy.data.objects.remove(inst, do_unlink=True)
+def _remove_frame_mesh(uid):
+    for c in (DOORFRAME_COLL, WINDOWFRAME_COLL):
+        inst = bpy.data.objects.get(f"GN_Frame_{uid}")
+        if inst:
+            bpy.data.objects.remove(inst, do_unlink=True)
+            return
 
 
-def add_door(context, xy, normal, base):
+def _remove_threshold(uid):
+    ob = bpy.data.objects.get(f"GN_Threshold_{uid}")
+    if ob:
+        bpy.data.objects.remove(ob, do_unlink=True)
+
+
+def _refresh_thresholds(context):
+    """Rebuild threshold strips for all door openings (or clear them if disabled)."""
     s = context.scene.gn_int
-    w, h, mesh = _active_door(s)
+    _clear_coll(THRESHOLD_COLL)
+    if not s.add_threshold:
+        return
+    coll = _get_coll(THRESHOLD_COLL)
+    depth = s.partition + 2.0 * s.threshold_depth
+    for op in s.openings:
+        if not op.is_door:
+            continue
+        n = Vector((op.nx, op.ny, 0.0)).normalized()
+        along = Vector((-n.y, n.x, 0.0))
+        up = Vector((0.0, 0.0, 1.0))
+        center = Vector((op.cx, op.cy, op.sill + s.threshold_height * 0.5))
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=2.0)
+        me = bpy.data.meshes.new(f"GN_Threshold_{op.uid}")
+        bm.to_mesh(me); bm.free()
+        ob = bpy.data.objects.new(f"GN_Threshold_{op.uid}", me)
+        coll.objects.link(ob)
+        M = Matrix(((along.x, n.x, up.x, center.x),
+                    (along.y, n.y, up.y, center.y),
+                    (along.z, n.z, up.z, center.z),
+                    (0.0, 0.0, 0.0, 1.0)))
+        ob.matrix_world = M @ Matrix.Diagonal(
+            (op.hw, depth * 0.5, max(s.threshold_height * 0.5, 1e-4))).to_4x4()
+
+
+def add_opening(context, xy, normal, base, kind):
+    s = context.scene.gn_int
+    w, h, sill, mesh = _active_preset(s, kind)
     op = s.openings.add()
     op.uid = _new_uid(s)
-    op.is_door = True
+    op.is_door = (kind == 'DOOR')
     op.cx, op.cy = xy.x, xy.y
     op.nx, op.ny = normal.x, normal.y
     op.hw = w * 0.5
-    op.sill = base
-    op.top = base + h
-    rebuild_rooms(context)
-    _place_door_mesh(op, mesh, w, h, base)
+    op.sill = base + sill
+    op.top = base + sill + h
+    rebuild_rooms(context)                      # also refreshes thresholds
+    _place_frame_mesh(op, mesh, w, h, kind)
 
 
-def remove_door(context, idx):
+def remove_opening(context, idx):
     s = context.scene.gn_int
-    _remove_door_mesh(s.openings[idx].uid)
+    uid = s.openings[idx].uid
+    _remove_frame_mesh(uid)
+    _remove_threshold(uid)
     s.openings.remove(idx)
     rebuild_rooms(context)
 
@@ -1348,108 +1419,141 @@ def _wall_under_cursor(context, event, max_dist=0.8):
     return best
 
 
-def _draw_door_ghost(self, context):
-    if not self.hover:
-        return
-    obj, xy, n, base = self.hover
-    s = context.scene.gn_int
-    w, h, _ = _active_door(s)
-    along = Vector((-n.y, n.x))
-    a = xy - along * (w * 0.5)
-    b = xy + along * (w * 0.5)
-    z0, z1 = base, base + h
-    pts = [(a.x, a.y, z0), (b.x, b.y, z0), (b.x, b.y, z1), (a.x, a.y, z1)]
-    color = (1.0, 0.3, 0.3, 1.0) if self.remove_hover else (0.1, 1.0, 0.3, 1.0)
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    gpu.state.blend_set('ALPHA')
-    gpu.state.line_width_set(2.5)
-    b2 = batch_for_shader(shader, 'LINE_LOOP', {"pos": pts})
-    shader.bind()
-    shader.uniform_float("color", color)
-    b2.draw(shader)
-    gpu.state.line_width_set(1.0)
+def _draw_opening_ghost(self, context):
+    try:
+        if not getattr(self, "hover", None):
+            return
+        _, xy, n, base = self.hover
+        s = context.scene.gn_int
+        w, h, sill, _ = _active_preset(s, self.kind)
+        along = Vector((-n.y, n.x))
+        a = xy - along * (w * 0.5)
+        b = xy + along * (w * 0.5)
+        z0, z1 = base + sill, base + sill + h
+        pts = [(a.x, a.y, z0), (b.x, b.y, z0), (b.x, b.y, z1), (a.x, a.y, z1)]
+        color = (1.0, 0.3, 0.3, 1.0) if self.remove_hover else (0.1, 1.0, 0.3, 1.0)
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.line_width_set(2.5)
+        batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": pts})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+        gpu.state.line_width_set(1.0)
+    except Exception:
+        pass
 
 
-class GN_OT_door_edit(Operator):
-    bl_idname = "gn_int.door_edit"
+def _presets_for(s, kind):
+    return (s.door_presets, "active_door_preset") if kind == 'DOOR' \
+        else (s.window_presets, "active_window_preset")
+
+
+class GN_OT_opening_edit(Operator):
+    bl_idname = "gn_int.opening_edit"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Door Edit Mode"
-    bl_description = ("Hover a wall to preview a door; LMB = add (cuts both rooms), "
-                      "LMB on a door = remove, Tab = next preset, Esc/RMB = exit")
+    bl_label = "Opening Edit Mode"
+    bl_description = ("Hover a wall to preview; LMB = add, LMB on an opening = remove, "
+                      "Tab = next preset, Esc/RMB = exit")
+    kind: EnumProperty(items=[('DOOR', "Door", ""), ('WINDOW', "Window", "")],
+                       default='DOOR', options={'HIDDEN'})
 
     def invoke(self, context, event):
         s = context.scene.gn_int
-        if not s.door_presets:
-            p = s.door_presets.add()
-            p.name = "Door"
+        presets, _ = _presets_for(s, self.kind)
+        if not presets:
+            p = presets.add()
+            p.name = self.kind.title()
         self.hover = None
         self.remove_hover = False
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
-            _draw_door_ghost, (self, context), 'WINDOW', 'POST_VIEW')
+            _draw_opening_ghost, (self, context), 'WINDOW', 'POST_VIEW')
         context.window_manager.modal_handler_add(self)
-        context.area.header_text_set("Door Edit: LMB add · LMB on door remove · Tab preset · Esc exit")
+        context.area.header_text_set(
+            f"{self.kind.title()} Edit: LMB add · LMB on one to remove · Tab preset · Esc exit")
         return {'RUNNING_MODAL'}
 
-    def modal(self, context, event):
-        context.area.tag_redraw()
-        s = context.scene.gn_int
-        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
-            return {'PASS_THROUGH'}
-        if event.type == 'MOUSEMOVE':
-            w = _wall_under_cursor(context, event)
-            if w:
-                xy, n, base = w
-                self.hover = (None, xy, n, base)
-                self.remove_hover = _door_under(s, xy, base + 0.1) >= 0
-            else:
-                self.hover = None
-                self.remove_hover = False
-            return {'RUNNING_MODAL'}
-        if event.type == 'TAB' and event.value == 'PRESS':
-            if s.door_presets:
-                s.active_door_preset = (s.active_door_preset + 1) % len(s.door_presets)
-            return {'RUNNING_MODAL'}
-        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            w = _wall_under_cursor(context, event)
-            if w:
-                xy, n, base = w
-                di = _door_under(s, xy, base + 0.1)
-                if di >= 0:
-                    remove_door(context, di)
-                else:
-                    add_door(context, xy, n, base)
-            return {'RUNNING_MODAL'}
-        if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+    def _cleanup(self, context):
+        try:
             bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+        except Exception:
+            pass
+        if context.area:
             context.area.header_text_set(None)
             context.area.tag_redraw()
-            return {'FINISHED'}
-        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        try:
+            if context.area:
+                context.area.tag_redraw()
+            s = context.scene.gn_int
+            want_door = (self.kind == 'DOOR')
+            if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+                return {'PASS_THROUGH'}
+            if event.type == 'MOUSEMOVE':
+                w = _wall_under_cursor(context, event)
+                if w:
+                    xy, n, base = w
+                    self.hover = (None, xy, n, base)
+                    self.remove_hover = _opening_under(s, xy, base + 0.1, want_door) >= 0
+                else:
+                    self.hover = None
+                    self.remove_hover = False
+                return {'RUNNING_MODAL'}
+            if event.type == 'TAB' and event.value == 'PRESS':
+                presets, attr = _presets_for(s, self.kind)
+                if presets:
+                    setattr(s, attr, (getattr(s, attr) + 1) % len(presets))
+                return {'RUNNING_MODAL'}
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                w = _wall_under_cursor(context, event)
+                if w:
+                    xy, n, base = w
+                    idx = _opening_under(s, xy, base + 0.1, want_door)
+                    if idx >= 0:
+                        remove_opening(context, idx)
+                    else:
+                        add_opening(context, xy, n, base, self.kind)
+                return {'RUNNING_MODAL'}
+            if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+                self._cleanup(context)
+                return {'FINISHED'}
+            return {'RUNNING_MODAL'}
+        except Exception as e:
+            print("[GN Interior] opening_edit error:", e)
+            self._cleanup(context)
+            return {'CANCELLED'}
 
 
-class GN_OT_door_preset_add(Operator):
-    bl_idname = "gn_int.door_preset_add"
+class GN_OT_preset_add(Operator):
+    bl_idname = "gn_int.preset_add"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Add Door Preset"
+    bl_label = "Add Preset"
+    kind: EnumProperty(items=[('DOOR', "Door", ""), ('WINDOW', "Window", "")],
+                       default='DOOR', options={'HIDDEN'})
 
     def execute(self, context):
         s = context.scene.gn_int
-        p = s.door_presets.add()
-        p.name = f"Door {len(s.door_presets)}"
-        s.active_door_preset = len(s.door_presets) - 1
+        presets, attr = _presets_for(s, self.kind)
+        p = presets.add()
+        p.name = f"{self.kind.title()} {len(presets)}"
+        setattr(s, attr, len(presets) - 1)
         return {'FINISHED'}
 
 
-class GN_OT_door_preset_remove(Operator):
-    bl_idname = "gn_int.door_preset_remove"
+class GN_OT_preset_remove(Operator):
+    bl_idname = "gn_int.preset_remove"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Remove Door Preset"
+    bl_label = "Remove Preset"
+    kind: EnumProperty(items=[('DOOR', "Door", ""), ('WINDOW', "Window", "")],
+                       default='DOOR', options={'HIDDEN'})
 
     def execute(self, context):
         s = context.scene.gn_int
-        if s.door_presets:
-            s.door_presets.remove(s.active_door_preset)
-            s.active_door_preset = max(0, s.active_door_preset - 1)
+        presets, attr = _presets_for(s, self.kind)
+        if presets:
+            presets.remove(getattr(s, attr))
+            setattr(s, attr, max(0, getattr(s, attr) - 1))
         return {'FINISHED'}
 
 
@@ -1530,35 +1634,60 @@ class GN_PT_interior(Panel):
         box = layout.box()
         box.label(text="Doors (between rooms):", icon='MESH_DATA')
         row = box.row()
-        row.template_list("GN_UL_door_presets", "", s, "door_presets",
+        row.template_list("GN_UL_door_presets", "doors", s, "door_presets",
                           s, "active_door_preset", rows=2)
         col = row.column(align=True)
-        col.operator("gn_int.door_preset_add", text="", icon='ADD')
-        col.operator("gn_int.door_preset_remove", text="", icon='REMOVE')
+        col.operator("gn_int.preset_add", text="", icon='ADD').kind = 'DOOR'
+        col.operator("gn_int.preset_remove", text="", icon='REMOVE').kind = 'DOOR'
         if 0 <= s.active_door_preset < len(s.door_presets):
             dp = s.door_presets[s.active_door_preset]
             box.prop(dp, "width")
             box.prop(dp, "height")
             box.prop(dp, "mesh_object")
-        box.operator("gn_int.door_edit", icon='GREASEPENCIL')
+        box.operator("gn_int.opening_edit", text="Door Edit Mode",
+                     icon='GREASEPENCIL').kind = 'DOOR'
+        box.prop(s, "add_threshold")
+        if s.add_threshold:
+            r = box.row(align=True)
+            r.prop(s, "threshold_height", text="H")
+            r.prop(s, "threshold_depth", text="D")
+
+        box = layout.box()
+        box.label(text="Windows:", icon='MESH_DATA')
+        row = box.row()
+        row.template_list("GN_UL_door_presets", "wins", s, "window_presets",
+                          s, "active_window_preset", rows=2)
+        col = row.column(align=True)
+        col.operator("gn_int.preset_add", text="", icon='ADD').kind = 'WINDOW'
+        col.operator("gn_int.preset_remove", text="", icon='REMOVE').kind = 'WINDOW'
+        if 0 <= s.active_window_preset < len(s.window_presets):
+            wp = s.window_presets[s.active_window_preset]
+            box.prop(wp, "width")
+            box.prop(wp, "height")
+            box.prop(wp, "sill")
+            box.prop(wp, "mesh_object")
+        box.operator("gn_int.opening_edit", text="Window Edit Mode",
+                     icon='GREASEPENCIL').kind = 'WINDOW'
 
 
 # ===========================================================================
 _classes = (
-    GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_IntProps,
+    GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset, GN_IntProps,
     GN_OT_set_exterior, GN_OT_add_floor_sel, GN_OT_add_floor_ground,
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
     GN_OT_project_openings, GN_OT_clear_openings,
-    GN_OT_door_edit, GN_OT_door_preset_add, GN_OT_door_preset_remove,
+    GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove,
     GN_UL_door_presets, GN_UL_floors, GN_PT_interior,
 )
 
 
 _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
                   "cleanup", "partition", "reveal", "uid_counter",
-                  "active_floor", "snap", "active_door_preset")
+                  "active_floor", "snap", "active_door_preset",
+                  "active_window_preset", "add_threshold", "threshold_height",
+                  "threshold_depth")
 
 
 def _dump_scene(scene):
@@ -1578,6 +1707,10 @@ def _dump_scene(scene):
         "door_presets": [{"name": p.name, "width": p.width, "height": p.height,
                           "mesh": p.mesh_object.name if p.mesh_object else ""}
                          for p in s.door_presets],
+        "window_presets": [{"name": p.name, "width": p.width, "height": p.height,
+                            "sill": p.sill,
+                            "mesh": p.mesh_object.name if p.mesh_object else ""}
+                           for p in s.window_presets],
     }
     scene["gn_int_backup"] = json.dumps(data)
 
@@ -1618,6 +1751,16 @@ def _restore_scene(scene):
         it.name = p.get("name", "Door")
         it.width = p.get("width", 0.9)
         it.height = p.get("height", 2.0)
+        mn = p.get("mesh", "")
+        if mn and mn in bpy.data.objects:
+            it.mesh_object = bpy.data.objects[mn]
+    s.window_presets.clear()
+    for p in data.get("window_presets", []):
+        it = s.window_presets.add()
+        it.name = p.get("name", "Window")
+        it.width = p.get("width", 1.0)
+        it.height = p.get("height", 1.2)
+        it.sill = p.get("sill", 0.9)
         mn = p.get("mesh", "")
         if mn and mn in bpy.data.objects:
             it.mesh_object = bpy.data.objects[mn]
