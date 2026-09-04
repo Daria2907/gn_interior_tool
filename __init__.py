@@ -2975,7 +2975,8 @@ def _mlo_portals_collection(scene):
 
 class GN_UL_portals(bpy.types.UIList):
     def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
-        layout.label(text=item.name, icon='OUTLINER_OB_LIGHTPROBE')
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", icon='OUTLINER_OB_LIGHTPROBE', emboss=False)
 
 
 class GN_OT_remove_portal(Operator):
@@ -2993,6 +2994,34 @@ class GN_OT_remove_portal(Operator):
         ob = coll.objects[s.portal_index]
         bpy.data.objects.remove(ob, do_unlink=True)
         s.portal_index = max(0, min(s.portal_index, len(coll.objects) - 1))
+        return {'FINISHED'}
+
+
+class GN_OT_flip_portal(Operator):
+    bl_idname = "gn_int.flip_portal"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Flip Selected Portal"
+    bl_description = "Flip the face normal of the selected portal"
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        coll = _mlo_portals_collection(context.scene)
+        if not coll or not (0 <= s.portal_index < len(coll.objects)):
+            self.report({'WARNING'}, "No portal selected")
+            return {'CANCELLED'}
+        ob = coll.objects[s.portal_index]
+        if ob.type != 'MESH':
+            self.report({'WARNING'}, "Selected portal has no mesh")
+            return {'CANCELLED'}
+        bm = bmesh.new()
+        bm.from_mesh(ob.data)
+        for f in bm.faces:
+            f.normal_flip()
+        bm.normal_update()
+        bm.to_mesh(ob.data)
+        bm.free()
+        ob.data.update()
+        self.report({'INFO'}, f"Flipped '{ob.name}'")
         return {'FINISHED'}
 
 
@@ -4582,7 +4611,10 @@ class GN_PT_manual_setup(_PanelBase, Panel):
             layout.label(text=f"{len(portals_col.objects)} portal(s):")
             layout.template_list("GN_UL_portals", "", portals_col, "objects",
                                  context.scene.gn_int, "portal_index", rows=4)
-            layout.operator("gn_int.remove_portal", icon='X')
+            row = layout.row(align=True)
+            row.operator("gn_int.flip_portal", icon='ARROW_LEFTRIGHT')
+            row.operator("gn_int.remove_portal", icon='X')
+            layout.label(text="Click a portal's name in the list to rename it", icon='INFO')
 
 
 class GN_PT_add_empties(_PanelBase, Panel):
@@ -4674,7 +4706,7 @@ _classes = (
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_add_room_collections, GN_OT_add_prop_collections, GN_OT_add_asset_collections,
     GN_OT_create_shell_collision,
-    GN_OT_create_portals, GN_OT_remove_portal,
+    GN_OT_create_portals, GN_OT_remove_portal, GN_OT_flip_portal,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
     GN_OT_project_openings, GN_OT_clear_openings,
