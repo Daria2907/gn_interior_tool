@@ -29,6 +29,7 @@ import bpy
 import bmesh
 import math
 import json
+import re
 import numpy as np
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -1876,38 +1877,50 @@ def _mlo_apply_collection_types(main_col):
             pass
 
 
-def _mlo_delete_collection_tree(col):
-    """Delete a collection and everything under it: every nested
-    sub-collection, and every object they contain (fully removed from the
-    .blend, not just unlinked). Returns (objects_removed, collections_removed)."""
-    obj_count = 0
+def _mlo_room_token_from_shell_name(shell_name, mlo_name):
+    """'<mlo_name>_<room_token>_shell.model' or '..._shell_NN.model' -> room_token.
+    None if shell_name doesn't match that pattern (leave unrecognised objects alone)."""
+    prefix = f"{mlo_name}_"
+    if not shell_name.startswith(prefix):
+        return None
+    rest = shell_name[len(prefix):]
+    if rest.endswith("_shell.model"):
+        return rest[:-len("_shell.model")]
+    m = re.match(r'^(.*)_shell_\d+\.model$', rest)
+    return m.group(1) if m else None
+
+
+def _mlo_delete_empty_tree(col):
+    """Delete col and its sub-collections, but ONLY where genuinely empty (no
+    objects, and every child was itself removable). A collection still holding
+    objects -- props the user placed, say -- is left in place. Returns
+    (kept_names, collections_removed)."""
+    kept = []
     col_count = 0
     for child in list(col.children):
-        oc, cc = _mlo_delete_collection_tree(child)
-        obj_count += oc
+        c_kept, cc = _mlo_delete_empty_tree(child)
+        kept.extend(c_kept)
         col_count += cc
-    for ob in list(col.objects):
-        try:
-            bpy.data.objects.remove(ob, do_unlink=True)
-            obj_count += 1
-        except Exception:
-            pass
+    if col.objects or col.children:
+        kept.append(col.name)
+        return kept, col_count
     try:
         bpy.data.collections.remove(col)
         col_count += 1
     except Exception:
-        pass
-    return obj_count, col_count
+        kept.append(col.name)
+    return kept, col_count
 
 
 class GN_OT_clean_mlo(Operator):
     bl_idname = "gn_int.clean_mlo"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clean MLO"
-    bl_description = ("Delete the int_<name> collection and everything in it -- "
-                      "shell meshes, room collections, and anything placed in "
-                      "Props/Assets since. Does NOT touch GN_Rooms, floors, or "
-                      "openings. Cannot be recovered except by Undo")
+    bl_description = ("Undo the MLO build: move each room shell mesh in Main "
+                      "back into GN_Rooms under its original name, delete the "
+                      "shell empty, then remove the int_<name> collection "
+                      "scaffolding. Any collection still holding real content "
+                      "(props/assets you placed) is left in place, not deleted")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -1920,9 +1933,42 @@ class GN_OT_clean_mlo(Operator):
         if main_col is None:
             self.report({'INFO'}, f"'{col_name}' doesn't exist - nothing to clean")
             return {'CANCELLED'}
-        obj_count, col_count = _mlo_delete_collection_tree(main_col)
-        self.report({'INFO'},
-                    f"Deleted {col_name}: {col_count} collection(s), {obj_count} object(s)")
+
+        main_room = None
+        for child in main_col.children:
+            if child.name == "Main":
+                main_room = child
+                break
+
+        restored = 0
+        if main_room:
+            room_coll = _get_coll(ROOM_COLL)
+            for ob in list(main_room.objects):
+                if ob.type == 'EMPTY' and ob.name == f"{name}_shell":
+                    bpy.data.objects.remove(ob, do_unlink=True)
+                    continue
+                if ob.type != 'MESH':
+                    continue
+                token = _mlo_room_token_from_shell_name(ob.name, name)
+                if token is None:
+                    continue   # not a recognised room shell -- leave it alone
+                world_mat = ob.matrix_world.copy()
+                ob.parent = None
+                ob.matrix_world = world_mat
+                if bpy.data.objects.get(token) in (None, ob):
+                    ob.name = token
+                    if ob.data:
+                        ob.data.name = token
+                for col in list(ob.users_collection):
+                    col.objects.unlink(ob)
+                room_coll.objects.link(ob)
+                restored += 1
+
+        kept, col_count = _mlo_delete_empty_tree(main_col)
+        msg = f"Restored {restored} room(s) to GN_Rooms, removed {col_count} empty collection(s)"
+        if kept:
+            msg += f" - kept (not empty): {', '.join(kept)}"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
