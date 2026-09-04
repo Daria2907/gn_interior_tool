@@ -508,18 +508,25 @@ def _turn_angle(a, b, c):
     return math.degrees(math.acos(dot))
 
 
-def _despike(poly, straight_deg=6.0, spike_deg=150.0):
-    """Drop vertices that are redundant (nearly straight) or spikes (the path
-    nearly reverses -- thin slivers). Rectilinear footprints only turn ~90deg,
-    so a reversal is always an artifact."""
+def _despike(poly, straight_deg=6.0, spike_deg=150.0, tooth_deg=30.0, tooth_len=1.5):
+    """Drop vertices that are redundant (nearly straight), spikes (the path
+    nearly reverses -- thin slivers), or raster staircase "teeth" (a wall
+    traced at a slight angle to the pixel grid produces an alternating
+    ~45/90deg sawtooth of SHORT edges -- individual turn angles are too
+    moderate to be caught as spikes, but both edges at the tooth are short).
+    Rectilinear footprints only turn ~90deg, so any of these is an artifact."""
     poly = list(poly)
     changed = True
     while changed and len(poly) > 3:
         changed = False
         n = len(poly)
         for i in range(n):
-            t = _turn_angle(poly[(i - 1) % n], poly[i], poly[(i + 1) % n])
-            if t < straight_deg or t > spike_deg:
+            a, b, c = poly[(i - 1) % n], poly[i], poly[(i + 1) % n]
+            t = _turn_angle(a, b, c)
+            len1 = math.hypot(b[0] - a[0], b[1] - a[1])
+            len2 = math.hypot(c[0] - b[0], c[1] - b[1])
+            is_tooth = t < tooth_deg and len1 < tooth_len and len2 < tooth_len
+            if t < straight_deg or t > spike_deg or is_tooth:
                 del poly[i]; changed = True; break
     return poly
 
