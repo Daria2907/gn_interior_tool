@@ -4263,7 +4263,7 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
             # recessed -> riser bottom -> tread back -> tip) from back_top,
             # closing the little gap under the nosing overhang that a single
             # wedge triangle (the no-nosing case below) would leave open
-            for side, arc_pts, back_pt, bot_pt in ((0, arc0, back0, bot0), (1, arc1, back1, bot1)):
+            for arc_pts, back_pt, bot_pt in ((arc0, back0, bot0), (arc1, back1, bot1)):
                 tri(back_pt, bot_pt, arc_pts[-1], MAT_STAIR_SIDE)
                 for k in range(_STAIR_NOSING_ARC_SEGS, 0, -1):
                     tri(back_pt, arc_pts[k], arc_pts[k - 1], MAT_STAIR_SIDE)
@@ -4308,6 +4308,19 @@ def _apply_stair_mesh(ob, verts, faces, cats):
     cat_layer = bm.faces.layers.int["gn_stair_cat"]
     for bf in bm.faces:
         bf.material_index = bf[cat_layer]
+    # smooth shading by angle: smooth across the rounded nosing arc (small
+    # angle between its segments), crisp at real corners (tread/riser, ~90deg)
+    ANGLE_THRESH = math.radians(35.0)
+    for bf in bm.faces:
+        bf.smooth = True
+    for be in bm.edges:
+        if len(be.link_faces) == 2:
+            try:
+                be.smooth = be.calc_face_angle() <= ANGLE_THRESH
+            except Exception:
+                be.smooth = False
+        else:
+            be.smooth = False
     bm.to_mesh(ob.data)
     bm.free()
     ob.data.update()
@@ -5342,6 +5355,215 @@ class GN_PT_create_asset(_PanelBase, Panel):
 
 
 # ===========================================================================
+# material tools -- cube-unwrap / rescale every face across the WHOLE scene
+# that shares a material, not just this add-on's own generated objects
+# ===========================================================================
+class GN_OT_cube_unwrap_by_material(Operator):
+    bl_idname = "gn_int.cube_unwrap_by_material"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Cube Unwrap by Material"
+    bl_description = ("Box/cube-project UVs for every face across the whole "
+                      "scene that uses the chosen material -- destructive, "
+                      "replaces the active UV layer")
+
+    material_name: StringProperty(name="Material", default="")
+    tile_size: FloatProperty(name="Tile Size (m)",
+        description="Metres per UV tile -- lower = more repetitions",
+        default=1.0, min=0.001, soft_max=20.0)
+    projection: EnumProperty(name="Projection", items=[
+        ('LOCAL', "Local", "Box-project using object-local coordinates"),
+        ('WORLD', "World", "Box-project using world-space coordinates -- "
+         "identical tiling on every object")], default='LOCAL')
+    rotate_uvs: EnumProperty(name="Rotate UVs", items=[
+        ('0', "0", "No rotation"), ('90', "90", "Rotate 90 degrees CCW"),
+        ('180', "180", "Rotate 180 degrees"),
+        ('270', "270", "Rotate 270 degrees CCW")], default='0')
+
+    def invoke(self, context, event):
+        ob = context.active_object
+        if ob and ob.active_material:
+            self.material_name = ob.active_material.name
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop_search(self, "material_name", bpy.data, "materials",
+                           text="Material", icon='MATERIAL')
+        layout.separator(factor=0.3)
+        layout.prop(self, "projection", expand=True)
+        layout.separator(factor=0.3)
+        layout.prop(self, "tile_size", slider=False)
+        layout.separator(factor=0.3)
+        layout.prop(self, "rotate_uvs", expand=True)
+        layout.separator(factor=0.3)
+        layout.label(text="Destructive -- replaces the active UV layer", icon='INFO')
+
+    def _apply(self, context):
+        mat = bpy.data.materials.get(self.material_name)
+        if mat is None:
+            return 0
+        sc = 1.0 / max(self.tile_size, 1e-4)
+        world = (self.projection == 'WORLD')
+        angle = math.radians(float(self.rotate_uvs))
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        patched = 0
+        for ob in context.scene.objects:
+            if ob.type != 'MESH':
+                continue
+            mat_indices = {i for i, slot in enumerate(ob.material_slots) if slot.material is mat}
+            if not mat_indices:
+                continue
+            me = ob.data
+            if not me.uv_layers:
+                me.uv_layers.new(name="UVMap")
+            uv = me.uv_layers.active
+            if uv is None or not uv.data:
+                continue
+            mw = ob.matrix_world
+            mw3 = mw.to_3x3()
+            for poly in me.polygons:
+                if poly.material_index not in mat_indices:
+                    continue
+                n = (mw3 @ poly.normal).normalized() if world else poly.normal
+                ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+                for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+                    vi = me.loops[li].vertex_index
+                    co = (mw @ me.vertices[vi].co) if world else me.vertices[vi].co
+                    if az >= ax and az >= ay:
+                        u, v = co.x * sc, co.y * sc
+                    elif ax >= ay:
+                        u, v = co.y * sc, co.z * sc
+                    else:
+                        u, v = co.x * sc, co.z * sc
+                    uv.data[li].uv = (u * cos_a - v * sin_a, u * sin_a + v * cos_a)
+            me.update()
+            patched += 1
+        return patched
+
+    def check(self, context):
+        self._apply(context)
+        return True
+
+    def execute(self, context):
+        mat = bpy.data.materials.get(self.material_name)
+        if mat is None:
+            self.report({'ERROR'}, f"Material '{self.material_name}' not found")
+            return {'CANCELLED'}
+        patched = self._apply(context)
+        if patched == 0:
+            self.report({'WARNING'}, f"No objects use '{self.material_name}'")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Cube-unwrapped {patched} object(s) using '{mat.name}'")
+        return {'FINISHED'}
+
+
+class GN_OT_scale_uv_by_material(Operator):
+    bl_idname = "gn_int.scale_uv_by_material"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Scale UVs by Material"
+    bl_description = ("Scale the UVs of every face across the whole scene "
+                      "that uses the chosen material -- unifies tiling on "
+                      "everything sharing it, live-previewed as you drag")
+
+    material_name: StringProperty(name="Material", default="")
+    factor: FloatProperty(name="Scale Factor",
+        description="> 1 tiles more, < 1 tiles less",
+        default=2.0, min=0.0001, soft_max=100.0)
+
+    def _snapshot(self, mat):
+        self._data = []
+        for ob in bpy.data.objects:
+            if ob.type != 'MESH':
+                continue
+            me = ob.data
+            uv = me.uv_layers.active
+            if not uv:
+                continue
+            mat_slots = {i for i, slot in enumerate(ob.material_slots) if slot.material is mat}
+            if not mat_slots:
+                continue
+            loop_indices = set()
+            for poly in me.polygons:
+                if poly.material_index in mat_slots:
+                    loop_indices.update(range(poly.loop_start, poly.loop_start + poly.loop_total))
+            if not loop_indices:
+                continue
+            orig = [l.uv.copy() for l in uv.data]
+            self._data.append((ob, uv, orig, loop_indices))
+
+    def _apply_factor(self):
+        f = self.factor
+        for ob, uv, orig, loop_indices in self._data:
+            for li, loop in enumerate(uv.data):
+                loop.uv = orig[li]
+            for li in loop_indices:
+                uv.data[li].uv = orig[li] * f
+            ob.data.update()
+
+    def invoke(self, context, event):
+        ob = context.active_object
+        if ob and ob.active_material:
+            self.material_name = ob.active_material.name
+        self._data = []
+        mat = bpy.data.materials.get(self.material_name)
+        if mat:
+            self._snapshot(mat)
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop_search(self, "material_name", bpy.data, "materials",
+                           text="Material", icon='MATERIAL')
+        layout.separator(factor=0.4)
+        layout.prop(self, "factor", slider=True)
+        layout.separator(factor=0.3)
+        layout.label(text=f"{len(getattr(self, '_data', []))} object(s) with "
+                     "this material will be affected", icon='INFO')
+
+    def check(self, context):
+        mat = bpy.data.materials.get(self.material_name)
+        if mat:
+            cur = {id(ob.data) for ob, *_ in getattr(self, '_data', [])}
+            match = {id(ob.data) for ob in bpy.data.objects
+                    if ob.type == 'MESH' and any(sl.material is mat for sl in ob.material_slots)}
+            if match != cur:
+                self._snapshot(mat)
+        else:
+            self._data = []
+        if self._data:
+            self._apply_factor()
+        return True
+
+    def execute(self, context):
+        mat = bpy.data.materials.get(self.material_name)
+        if mat is None:
+            self.report({'ERROR'}, f"Material '{self.material_name}' not found")
+            return {'CANCELLED'}
+        if not getattr(self, '_data', None):
+            self._snapshot(mat)
+        if not self._data:
+            self.report({'WARNING'}, f"No objects with a UV map use '{self.material_name}'")
+            return {'CANCELLED'}
+        self._apply_factor()
+        self.report({'INFO'}, f"UV scale x{self.factor:.3f} applied to "
+                    f"{len(self._data)} object(s) using '{mat.name}'")
+        return {'FINISHED'}
+
+
+class GN_PT_material_tools(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Material Tools"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Affects every object in the scene sharing the "
+                     "chosen material, not just this add-on's own", icon='INFO')
+        layout.operator("gn_int.cube_unwrap_by_material", icon='MOD_UVPROJECT')
+        layout.operator("gn_int.scale_uv_by_material", icon='FULLSCREEN_ENTER')
+
+
+# ===========================================================================
 _classes = (
     GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset,
     GN_CustomEmptyItem, GN_IntProps,
@@ -5358,6 +5580,7 @@ _classes = (
     GN_OT_create_portals, GN_OT_remove_portal, GN_OT_flip_portal, GN_OT_clear_portals,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
+    GN_OT_cube_unwrap_by_material, GN_OT_scale_uv_by_material,
     GN_OT_split_opening_pieces, GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_OT_clean_stale_openings,
@@ -5366,6 +5589,7 @@ _classes = (
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms, GN_PT_stairs,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo, GN_PT_manual_setup,
     GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
+    GN_PT_material_tools,
 )
 
 
