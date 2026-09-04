@@ -3101,6 +3101,25 @@ def _floor_idx_for_z(context, z):
     return None
 
 
+def _room_token_for_uid(context, uid):
+    """Numeric portal token ('1', '2', ...) for the room with this uid,
+    finding its shell object wherever it currently lives -- still the raw
+    'r0N' object in GN_Rooms (before Build MLO), or already moved/renamed by
+    Build MLO to '<mlo_name>_r0N_shell.model' (inside Main). Search is
+    global by the gn_room_uid custom prop rather than one fixed collection,
+    since Build MLO relocates the object."""
+    s = context.scene.gn_int
+    mlo_name = s.mlo_name.strip()
+    for ob in bpy.data.objects:
+        if ob.get("gn_room_uid") == uid:
+            if mlo_name:
+                t = _mlo_room_token_from_shell_name(ob.name, mlo_name)
+                if t is not None:
+                    return _mlo_room_token(t)
+            return _mlo_room_token(ob.name)
+    return None
+
+
 def _rooms_for_opening(context, o):
     """Which two rooms an opening borders: sample a point just inside the
     wall on each side of its normal, on the floor matching its Z. A side
@@ -3116,18 +3135,13 @@ def _rooms_for_opening(context, o):
     nrm = nrm.normalized()
     center = Vector((o.cx, o.cy))
     probe = max(o.hw * 0.5, 0.3)
-    room_coll = bpy.data.collections.get(ROOM_COLL)
 
     def token_at(pt):
         ridx = _room_at_point(context, fi, pt)
         if ridx < 0:
             return "limbo"
-        uid = s.rooms[ridx].uid
-        if room_coll:
-            for ob in room_coll.objects:
-                if ob.get("gn_room_uid") == uid:
-                    return _mlo_room_token(ob.name)
-        return "limbo"
+        token = _room_token_for_uid(context, s.rooms[ridx].uid)
+        return token if token is not None else "limbo"
 
     return token_at(center + nrm * probe), token_at(center - nrm * probe)
 
