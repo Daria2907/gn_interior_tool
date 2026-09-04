@@ -4161,13 +4161,19 @@ def _selected_edge_endpoints(context):
     return out
 
 
+_STAIR_MATS = (("GN_StairTop", (0.55, 0.45, 0.35, 1.0)),   # 0 -- treads
+              ("GN_StairSide", (0.55, 0.55, 0.57, 1.0)))   # 1 -- risers, side wedges, soffit
+MAT_STAIR_TOP, MAT_STAIR_SIDE = 0, 1
+
+
 def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
     """Solid staircase (treads, risers, closed sides, soffit) running from
     edge (b0,b1) up to edge (t0,t1). Each edge is assumed roughly level (flat
     at its own Z); the two edges need not be parallel or the same length --
-    the sides taper linearly between them. Returns (verts, faces) in world
-    space, or None if the edges are too close in height or in the travel
-    direction to form a run."""
+    the sides taper linearly between them. Returns (verts, faces, cats) in
+    world space -- cats parallels faces with a MAT_STAIR_* index per face --
+    or None if the edges are too close in height or in the travel direction
+    to form a run."""
     b_mid = (b0 + b1) / 2; t_mid = (t0 + t1) / 2
     if t_mid.z < b_mid.z:
         b0, b1, t0, t1 = t0, t1, b0, b1
@@ -4192,17 +4198,19 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
         y = bp.y + (tp.y - bp.y) * t
         return x, y
 
-    verts, faces = [], []
+    verts, faces, cats = [], [], []
 
-    def quad(a, b, c, d_):
+    def quad(a, b, c, d_, cat):
         base = len(verts)
         verts.extend([a, b, c, d_])
         faces.append((base, base + 1, base + 2, base + 3))
+        cats.append(cat)
 
-    def tri(a, b, c):
+    def tri(a, b, c, cat):
         base = len(verts)
         verts.extend([a, b, c])
         faces.append((base, base + 1, base + 2))
+        cats.append(cat)
 
     for i in range(n):
         tf, tb = i / n, (i + 1) / n
@@ -4210,34 +4218,45 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
         x0f, y0f = side_xy(b0, t0, tf); x1f, y1f = side_xy(b1, t1, tf)
         x0b, y0b = side_xy(b0, t0, tb); x1b, y1b = side_xy(b1, t1, tb)
         # tread (top of the step)
-        quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh))
+        quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
         # riser (front face of the step)
-        quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh))
+        quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
         # side wedges: close the gap between the stepped profile and the
         # straight incline underneath, on both sides
-        tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh))
-        tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh))
+        tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh), MAT_STAIR_SIDE)
+        tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh), MAT_STAIR_SIDE)
 
     # soffit -- the single straight incline closing the underside
-    quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top))
-    return verts, faces
+    quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top), MAT_STAIR_SIDE)
+    return verts, faces, cats
 
 
-def _apply_stair_mesh(ob, verts, faces):
-    """Write world-space verts/faces (from _build_stairs_between_edges) into
-    ob's existing mesh data, converting through the object's CURRENT
+def _apply_stair_mesh(ob, verts, faces, cats):
+    """Write world-space verts/faces/cats (from _build_stairs_between_edges)
+    into ob's existing mesh data, converting through the object's CURRENT
     matrix_world (so this still works if the stair object has been moved or
-    rotated since it was created)."""
+    rotated since it was created). cats assigns each face's material index
+    (GN_StairTop for treads, GN_StairSide for everything else) -- material
+    slots are (re)built fresh each time so a rebuild can't drift out of sync
+    with face order."""
     mw_inv = ob.matrix_world.inverted()
     bm = bmesh.new()
     bverts = [bm.verts.new(mw_inv @ Vector(v)) for v in verts]
-    for f in faces:
+    cat_layer = bm.faces.layers.int.new("gn_stair_cat")
+    for f, cat in zip(faces, cats):
         try:
-            bm.faces.new([bverts[i] for i in f])
+            bf = bm.faces.new([bverts[i] for i in f])
+            bf[cat_layer] = cat
         except ValueError:
             pass
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    ob.data.materials.clear()
+    for name, color in _STAIR_MATS:
+        ob.data.materials.append(_get_mat(name, color))
+    cat_layer = bm.faces.layers.int["gn_stair_cat"]
+    for bf in bm.faces:
+        bf.material_index = bf[cat_layer]
     bm.to_mesh(ob.data)
     bm.free()
     ob.data.update()
