@@ -4229,10 +4229,10 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         faces.append((base, base + 1, base + 2, base + 3))
         cats.append(cat)
 
-    def tri(a, b, c, cat):
+    def ngon(pts, cat):
         base = len(verts)
-        verts.extend([a, b, c])
-        faces.append((base, base + 1, base + 2))
+        verts.extend(pts)
+        faces.append(tuple(range(base, base + len(pts))))
         cats.append(cat)
 
     def step_nosing_r(rise_):
@@ -4275,36 +4275,34 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
     quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_bot), (t0.x, t0.y, z_bot), MAT_STAIR_SIDE)
     quad((t0.x, t0.y, z_bot), (t1.x, t1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top), MAT_STAIR_SIDE)
 
-    # side caps: the stepped silhouette (from the front-bottom corner, up
-    # through every riser/tread/nosing corner, to the top-back corner), then
-    # straight down the back and across the bottom -- fan-triangulated from
-    # the front-bottom corner, which can see every other boundary point
-    # since the whole outline is a simple, non-crossing staircase shape
-    def side_boundary(b, t):
-        pts = [(b.x, b.y, z_bot)]
+    # sides: one flat face PER STEP, each reaching all the way down to
+    # z_bot (not stacked on the previous step) -- consecutive step faces
+    # sit side by side at different X ranges, so together they trace the
+    # staircase silhouette with plain, planar quads. A single fan spanning
+    # the whole run (the previous approach) is technically valid but its
+    # internal diagonals, radiating from one far corner across every step,
+    # show up as a visible mess of crossing lines -- this per-step version
+    # is how room_tool.py builds its own stair stringers, for the same
+    # reason ("avoid the concave N-gon fan triangulation that produced
+    # diagonal artifacts").
+    for b, t in ((b0, t0), (b1, t1)):
         for i in range(n):
             tf, tb = i / n, (i + 1) / n
-            zl, zh = z_bot + i * rise, z_bot + (i + 1) * rise
+            zh = z_bot + (i + 1) * rise
             xf, yf = side_xy(b, t, tf)
             xb, yb = side_xy(b, t, tb)
+            pts = [(xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh)]
             R = step_nosing_r(rise)
             if R > 1e-4:
                 f = fwd(xf, yf, xb, yb)
-                for k in range(_STAIR_NOSING_ARC_SEGS, -1, -1):
+                for k in range(_STAIR_NOSING_ARC_SEGS + 1):  # tip (0) to recessed (90)
                     th = thetas[k]
                     off = -R + R * math.sin(th)
                     zz = (zh - R) + R * math.cos(th)
                     pts.append((xf + f.x * off, yf + f.y * off, zz))
             else:
                 pts.append((xf, yf, zh))
-            pts.append((xb, yb, zh))
-        pts.append((t.x, t.y, z_bot))
-        return pts
-
-    for b, t in ((b0, t0), (b1, t1)):
-        pts = side_boundary(b, t)
-        for i in range(1, len(pts) - 1):
-            tri(pts[0], pts[i], pts[i + 1], MAT_STAIR_SIDE)
+            ngon(pts, MAT_STAIR_SIDE)
 
     return verts, faces, cats
 
