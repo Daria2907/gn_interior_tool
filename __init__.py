@@ -750,10 +750,10 @@ def _cb_threshold(self, context):
 
 
 def _cb_stair_settings(self, context):
-    """Live-rebuild the selected stair(s) when Step Height/Depth changes.
-    _rebuild_stair_mesh is defined later in the file (near the rest of the
-    stairs feature) -- fine, since a function body only resolves names at
-    CALL time, and by then the whole module has finished loading.
+    """Live-rebuild the selected stair(s) when Step Height/Depth/Nosing
+    changes. _rebuild_stair_mesh is defined later in the file (near the rest
+    of the stairs feature) -- fine, since a function body only resolves
+    names at CALL time, and by then the whole module has finished loading.
 
     Deferred via a timer for the same reentrancy reason as _cb_threshold
     above: rebuilding objects directly inside a property update callback can
@@ -765,14 +765,14 @@ def _cb_stair_settings(self, context):
              if ob.type == 'MESH' and "gn_stair_data" in ob]
     if not names:
         return
-    height, depth = self.stair_step_height, self.stair_step_depth
+    height, depth, nosing = self.stair_step_height, self.stair_step_depth, self.stair_nosing
 
     def _do():
         for nm in names:
             ob = bpy.data.objects.get(nm)
             if ob:
                 try:
-                    _rebuild_stair_mesh(ob, height, depth)
+                    _rebuild_stair_mesh(ob, height, depth, nosing)
                 except Exception as e:
                     print("[GN Interior] stair update:", e)
         return None
@@ -1116,6 +1116,12 @@ class GN_IntProps(PropertyGroup):
         description="Target tread depth per step (actual may come out lower "
         "to divide the run evenly). Also live-updates any selected, "
         "already-created stairs",
+        update=_cb_stair_settings)
+    stair_nosing: FloatProperty(name="Nosing", default=0.0,
+        min=0.0, max=0.1, unit='LENGTH',
+        description="Rounded overhang at the front of each tread, recessing "
+        "the riser to match (0 = square edge, flush riser). Also "
+        "live-updates any selected, already-created stairs",
         update=_cb_stair_settings)
 
 
@@ -4166,14 +4172,19 @@ _STAIR_MATS = (("GN_StairTop", (0.55, 0.45, 0.35, 1.0)),   # 0 -- treads
 MAT_STAIR_TOP, MAT_STAIR_SIDE = 0, 1
 
 
-def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
+_STAIR_NOSING_ARC_SEGS = 4
+
+
+def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=0.0):
     """Solid staircase (treads, risers, closed sides, soffit) running from
     edge (b0,b1) up to edge (t0,t1). Each edge is assumed roughly level (flat
     at its own Z); the two edges need not be parallel or the same length --
-    the sides taper linearly between them. Returns (verts, faces, cats) in
-    world space -- cats parallels faces with a MAT_STAIR_* index per face --
-    or None if the edges are too close in height or in the travel direction
-    to form a run."""
+    the sides taper linearly between them. nosing > 0 rounds the tread's
+    front edge into a small overhanging lip (radius = nosing), recessing the
+    riser to match -- a quarter-circle profile, swept across the width and
+    capped at each side. Returns (verts, faces, cats) in world space --
+    cats parallels faces with a MAT_STAIR_* index per face -- or None if the
+    edges are too close in height or in the travel direction to form a run."""
     b_mid = (b0 + b1) / 2; t_mid = (t0 + t1) / 2
     if t_mid.z < b_mid.z:
         b0, b1, t0, t1 = t0, t1, b0, b1
@@ -4217,14 +4228,53 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
         zl, zh = z_bot + i * rise, z_bot + (i + 1) * rise
         x0f, y0f = side_xy(b0, t0, tf); x1f, y1f = side_xy(b1, t1, tf)
         x0b, y0b = side_xy(b0, t0, tb); x1b, y1b = side_xy(b1, t1, tb)
-        # tread (top of the step)
-        quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
-        # riser (front face of the step)
-        quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
-        # side wedges: close the gap between the stepped profile and the
-        # straight incline underneath, on both sides
-        tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh), MAT_STAIR_SIDE)
-        tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh), MAT_STAIR_SIDE)
+        R = min(nosing, rise * 0.9) if nosing > 1e-4 else 0.0
+
+        if R > 1e-4:
+            def fwd(fx, fy, bx, by):
+                v = Vector((bx - fx, by - fy))
+                return v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0))
+            f0 = fwd(x0f, y0f, x0b, y0b)
+            f1 = fwd(x1f, y1f, x1b, y1b)
+
+            def arc(fx, fy, f, theta):
+                off = -R + R * math.sin(theta)
+                zz = (zh - R) + R * math.cos(theta)
+                return (fx + f.x * off, fy + f.y * off, zz)
+
+            thetas = [(k / _STAIR_NOSING_ARC_SEGS) * (math.pi / 2)
+                     for k in range(_STAIR_NOSING_ARC_SEGS + 1)]
+            arc0 = [arc(x0f, y0f, f0, th) for th in thetas]
+            arc1 = [arc(x1f, y1f, f1, th) for th in thetas]
+            tip0, tip1 = arc0[0], arc1[0]           # theta=0: flush with tread top
+            rec0, rec1 = arc0[-1], arc1[-1]         # theta=90: recessed riser start
+            back0, back1 = (x0b, y0b, zh), (x1b, y1b, zh)
+            bot0, bot1 = (x0f, y0f, zl), (x1f, y1f, zl)
+
+            # tread now runs from the nosing tip back to the tread's back edge
+            quad(back0, back1, tip1, tip0, MAT_STAIR_TOP)
+            # the rounded nosing underside, swept across the width
+            for k in range(_STAIR_NOSING_ARC_SEGS):
+                quad(arc0[k], arc1[k], arc1[k + 1], arc0[k + 1], MAT_STAIR_SIDE)
+            # riser, starting recessed under the nosing
+            quad(bot0, bot1, rec1, rec0, MAT_STAIR_SIDE)
+            # side caps: fan-triangulate the full step outline (tip -> arc ->
+            # recessed -> riser bottom -> tread back -> tip) from back_top,
+            # closing the little gap under the nosing overhang that a single
+            # wedge triangle (the no-nosing case below) would leave open
+            for side, arc_pts, back_pt, bot_pt in ((0, arc0, back0, bot0), (1, arc1, back1, bot1)):
+                tri(back_pt, bot_pt, arc_pts[-1], MAT_STAIR_SIDE)
+                for k in range(_STAIR_NOSING_ARC_SEGS, 0, -1):
+                    tri(back_pt, arc_pts[k], arc_pts[k - 1], MAT_STAIR_SIDE)
+        else:
+            # tread (top of the step)
+            quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
+            # riser (front face of the step)
+            quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
+            # side wedges: close the gap between the stepped profile and the
+            # straight incline underneath, on both sides
+            tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh), MAT_STAIR_SIDE)
+            tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh), MAT_STAIR_SIDE)
 
     # soffit -- the single straight incline closing the underside
     quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top), MAT_STAIR_SIDE)
@@ -4262,10 +4312,10 @@ def _apply_stair_mesh(ob, verts, faces, cats):
     ob.data.update()
 
 
-def _rebuild_stair_mesh(ob, height, depth):
+def _rebuild_stair_mesh(ob, height, depth, nosing=0.0):
     """Re-run the stair build for an EXISTING stair object at new
-    height/depth settings, using the original two edges stored on it at
-    creation time. Returns True if ob was a stair and got rebuilt."""
+    height/depth/nosing settings, using the original two edges stored on it
+    at creation time. Returns True if ob was a stair and got rebuilt."""
     raw = ob.get("gn_stair_data")
     if not raw:
         return False
@@ -4275,7 +4325,7 @@ def _rebuild_stair_mesh(ob, height, depth):
         t0, t1 = Vector(d["t0"]), Vector(d["t1"])
     except Exception:
         return False
-    built = _build_stairs_between_edges(b0, b1, t0, t1, height, depth)
+    built = _build_stairs_between_edges(b0, b1, t0, t1, height, depth, nosing)
     if not built:
         return False
     _apply_stair_mesh(ob, *built)
@@ -4303,7 +4353,8 @@ class GN_OT_create_stairs(Operator):
             return {'CANCELLED'}
         (b0, b1), (t0, t1) = pairs
         built = _build_stairs_between_edges(b0, b1, t0, t1,
-                                            s.stair_step_height, s.stair_step_depth)
+                                            s.stair_step_height, s.stair_step_depth,
+                                            s.stair_nosing)
         if not built:
             self.report({'ERROR'}, "The two edges are too close together (in height or distance) to build a run")
             return {'CANCELLED'}
@@ -5081,6 +5132,7 @@ class GN_PT_stairs(_PanelBase, Panel):
         col = layout.column(align=True)
         col.prop(s, "stair_step_height")
         col.prop(s, "stair_step_depth")
+        col.prop(s, "stair_nosing")
         layout.operator("gn_int.create_stairs", icon='MOD_ARRAY')
         layout.label(text="Edit Mode: pick 1 edge at the bottom, 1 at the", icon='INFO')
         layout.label(text="top (can be on 2 different objects), then run")
@@ -5320,7 +5372,8 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "sample_offset",
                   "mlo_name", "timecycle_name", "timecycle_auto",
                   "build_main", "build_room_colls", "build_prop_colls",
                   "build_asset_colls", "build_shell_collision", "build_portals",
-                  "build_empties", "stair_step_height", "stair_step_depth")
+                  "build_empties", "stair_step_height", "stair_step_depth",
+                  "stair_nosing")
 
 
 def _dump_scene(scene):
