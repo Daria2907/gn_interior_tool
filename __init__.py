@@ -780,6 +780,46 @@ def _cb_stair_settings(self, context):
     bpy.app.timers.register(_do, first_interval=0.0)
 
 
+def _cb_mlo_name(self, context):
+    """Keep Timecycle prefilled with the MLO Name as it's typed, until the
+    user edits Timecycle to something else (then they're independent).
+    Deferred via a timer for the same undo/redo reentrancy reason as
+    _cb_threshold above."""
+    if _SUSPEND_CB or not self.timecycle_auto:
+        return
+    scene_name = context.scene.name
+    name = self.mlo_name
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        s = scene.gn_int
+        if s.timecycle_auto:
+            s.timecycle_name = name
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
+def _cb_timecycle_name(self, context):
+    """Editing Timecycle by hand de-links it from MLO Name (re-links if it's
+    typed back to match). Deferred via a timer, same reentrancy reason."""
+    if _SUSPEND_CB:
+        return
+    scene_name = context.scene.name
+    matches = (self.timecycle_name == self.mlo_name)
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        scene.gn_int.timecycle_auto = matches
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
 def _cb_floor_select(self, context):
     """Selecting a floor in the list selects its boundary + rooms in the
     scene, so the Outliner and viewport highlight what you're looking at.
@@ -963,9 +1003,13 @@ class GN_IntProps(PropertyGroup):
         "this many metres")
     mlo_name: StringProperty(name="MLO Name", default="",
         description="Interior name -> collection 'int_<name>', shell empty "
-        "'<name>_shell'. Run this once, after rooms/doors are finished")
+        "'<name>_shell'. Run this once, after rooms/doors are finished",
+        update=_cb_mlo_name)
     timecycle_name: StringProperty(name="Timecycle", default="",
-        description="RageKit room timecycle name (optional)")
+        description="RageKit room timecycle name (optional). Prefilled from "
+        "MLO Name until you edit it yourself", update=_cb_timecycle_name)
+    timecycle_auto: BoolProperty(default=True, options={'HIDDEN'},
+        description="Internal: Timecycle is still following MLO Name")
 
     # ── Add Empties ─────────────────────────────────────────────────────
     empty_decals: BoolProperty(name="Decals", default=False)
@@ -1371,6 +1415,7 @@ class GN_OT_clean_interior(Operator):
         s.openings.clear()
         s.mlo_name = ""
         s.timecycle_name = ""
+        s.timecycle_auto = True
         _clear_coll(BOUND_COLL)
         _clear_coll(ROOM_COLL)
         _clear_coll(DOORFRAME_COLL)
@@ -5121,7 +5166,7 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "sample_offset",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
                   "threshold_depth", "threshold_flip", "threshold_offset",
-                  "mlo_name", "timecycle_name",
+                  "mlo_name", "timecycle_name", "timecycle_auto",
                   "build_main", "build_room_colls", "build_prop_colls",
                   "build_asset_colls", "build_shell_collision", "build_portals",
                   "build_empties", "stair_step_height", "stair_step_depth")
