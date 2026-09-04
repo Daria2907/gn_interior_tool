@@ -48,6 +48,7 @@ DOORFRAME_COLL = "GN_DoorFrames"
 WINDOWFRAME_COLL = "GN_WindowFrames"
 THRESHOLD_COLL = "GN_Thresholds"
 OPENING_PIECES_COLL = "Openings"
+STAIR_COLL = "GN_Stairs"
 
 
 # ===========================================================================
@@ -1025,6 +1026,14 @@ class GN_IntProps(PropertyGroup):
     partition: FloatProperty(name="Partition Wall", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Gap left between two rooms when splitting "
         "(the interior partition wall thickness)")
+    stair_step_height: FloatProperty(name="Step Height", default=0.18,
+        min=0.02, max=0.5, unit='LENGTH',
+        description="Target riser height per step (actual may come out lower "
+        "to divide the run evenly)")
+    stair_step_depth: FloatProperty(name="Step Depth", default=0.28,
+        min=0.05, max=1.0, unit='LENGTH',
+        description="Target tread depth per step (actual may come out lower "
+        "to divide the run evenly)")
 
 
 # ===========================================================================
@@ -3916,6 +3925,137 @@ class GN_OT_split_edges(Operator):
 
 
 # ===========================================================================
+# stairs (solid flight built between two picked edges)
+# ===========================================================================
+def _selected_edge_endpoints(context):
+    """World-space (v0, v1) pairs for every selected edge across every mesh
+    object currently in Edit Mode (supports multi-object edit)."""
+    out = []
+    for ob in context.objects_in_mode:
+        if ob.type != 'MESH':
+            continue
+        bm = bmesh.from_edit_mesh(ob.data)
+        mw = ob.matrix_world
+        for e in bm.edges:
+            if e.select:
+                a, b = e.verts
+                out.append((mw @ a.co, mw @ b.co))
+    return out
+
+
+def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
+    """Solid staircase (treads, risers, closed sides, soffit) running from
+    edge (b0,b1) up to edge (t0,t1). Each edge is assumed roughly level (flat
+    at its own Z); the two edges need not be parallel or the same length --
+    the sides taper linearly between them. Returns (verts, faces) in world
+    space, or None if the edges are too close in height or in the travel
+    direction to form a run."""
+    b_mid = (b0 + b1) / 2; t_mid = (t0 + t1) / 2
+    if t_mid.z < b_mid.z:
+        b0, b1, t0, t1 = t0, t1, b0, b1
+        b_mid, t_mid = t_mid, b_mid
+    dz = t_mid.z - b_mid.z
+    travel = (Vector((t_mid.x, t_mid.y)) - Vector((b_mid.x, b_mid.y))).length
+    if dz < 0.05 or travel < 0.05:
+        return None
+    # pair up b-side / t-side verts so the run doesn't twist
+    d_same = (b0 - t0).length + (b1 - t1).length
+    d_swap = (b0 - t1).length + (b1 - t0).length
+    if d_swap < d_same:
+        t0, t1 = t1, t0
+    z_bot, z_top = b_mid.z, t_mid.z
+
+    n = max(2, math.ceil(dz / max(step_height, 0.02)),
+                math.ceil(travel / max(step_depth, 0.02)))
+    rise = dz / n
+
+    def side_xy(bp, tp, t):
+        x = bp.x + (tp.x - bp.x) * t
+        y = bp.y + (tp.y - bp.y) * t
+        return x, y
+
+    verts, faces = [], []
+
+    def quad(a, b, c, d_):
+        base = len(verts)
+        verts.extend([a, b, c, d_])
+        faces.append((base, base + 1, base + 2, base + 3))
+
+    def tri(a, b, c):
+        base = len(verts)
+        verts.extend([a, b, c])
+        faces.append((base, base + 1, base + 2))
+
+    for i in range(n):
+        tf, tb = i / n, (i + 1) / n
+        zl, zh = z_bot + i * rise, z_bot + (i + 1) * rise
+        x0f, y0f = side_xy(b0, t0, tf); x1f, y1f = side_xy(b1, t1, tf)
+        x0b, y0b = side_xy(b0, t0, tb); x1b, y1b = side_xy(b1, t1, tb)
+        # tread (top of the step)
+        quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh))
+        # riser (front face of the step)
+        quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh))
+        # side wedges: close the gap between the stepped profile and the
+        # straight incline underneath, on both sides
+        tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh))
+        tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh))
+
+    # soffit -- the single straight incline closing the underside
+    quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top))
+    return verts, faces
+
+
+class GN_OT_create_stairs(Operator):
+    bl_idname = "gn_int.create_stairs"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Create Stairs"
+    bl_description = ("Edit Mode: select two edges (one at the bottom, one at "
+                      "the top -- can be on two different objects, e.g. two "
+                      "floor boundaries) and build a solid flight of stairs "
+                      "between them")
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        pairs = _selected_edge_endpoints(context)
+        if len(pairs) != 2:
+            self.report({'ERROR'}, f"Select exactly 2 edges (one top, one bottom) -- {len(pairs)} selected")
+            return {'CANCELLED'}
+        (b0, b1), (t0, t1) = pairs
+        built = _build_stairs_between_edges(b0, b1, t0, t1,
+                                            s.stair_step_height, s.stair_step_depth)
+        if not built:
+            self.report({'ERROR'}, "The two edges are too close together (in height or distance) to build a run")
+            return {'CANCELLED'}
+        verts, faces = built
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bm = bmesh.new()
+        bverts = [bm.verts.new(v) for v in verts]
+        for f in faces:
+            try:
+                bm.faces.new([bverts[i] for i in f])
+            except ValueError:
+                pass
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+        coll = _get_coll(STAIR_COLL)
+        name = f"GN_Stairs.{len(coll.objects):03d}"
+        me = bpy.data.meshes.new(name)
+        bm.to_mesh(me)
+        bm.free()
+        ob = bpy.data.objects.new(name, me)
+        coll.objects.link(ob)
+        context.view_layer.objects.active = ob
+        bpy.ops.object.select_all(action='DESELECT')
+        ob.select_set(True)
+        self.report({'INFO'}, f"Created {name}")
+        return {'FINISHED'}
+
+
+# ===========================================================================
 # window / door openings (boolean projection)
 # ===========================================================================
 def _piece_frame(obj):
@@ -4654,6 +4794,22 @@ class GN_PT_rooms(_PanelBase, Panel):
         layout.operator("gn_int.reunwrap", icon='UV')
 
 
+class GN_PT_stairs(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "Stairs"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(s, "stair_step_height")
+        col.prop(s, "stair_step_depth")
+        layout.operator("gn_int.create_stairs", icon='MOD_ARRAY')
+        layout.label(text="Edit Mode: pick 1 edge at the bottom, 1 at the", icon='INFO')
+        layout.label(text="top (can be on 2 different objects), then run")
+
+
 class GN_PT_openings(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Openings (project)"
@@ -4860,7 +5016,7 @@ _classes = (
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear, GN_OT_clean_interior,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
-    GN_OT_split_edges,
+    GN_OT_split_edges, GN_OT_create_stairs,
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_add_room_collections, GN_OT_add_prop_collections, GN_OT_add_asset_collections,
     GN_OT_create_shell_collision,
@@ -4872,7 +5028,7 @@ _classes = (
     GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
     GN_UL_portals,
-    GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
+    GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms, GN_PT_stairs,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo, GN_PT_manual_setup,
     GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
 )
@@ -4887,7 +5043,7 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "sample_offset",
                   "mlo_name", "timecycle_name",
                   "build_main", "build_room_colls", "build_prop_colls",
                   "build_asset_colls", "build_shell_collision", "build_portals",
-                  "build_empties")
+                  "build_empties", "stair_step_height", "stair_step_depth")
 
 
 def _dump_scene(scene):
