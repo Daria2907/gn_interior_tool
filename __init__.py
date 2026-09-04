@@ -3120,30 +3120,71 @@ def _room_token_for_uid(context, uid):
     return None
 
 
-def _rooms_for_opening(context, o):
-    """Which two rooms an opening borders: sample a point just inside the
-    wall on each side of its normal, on the floor matching its Z. A side
-    that isn't inside any room (facing outdoors) is labelled 'limbo' --
-    e.g. '1 - limbo' -- matching the real portal-naming convention."""
+def _wall_room_for_opening(context, o, want_sign):
+    """The room bordering this opening on one particular side, found by the
+    SAME wall-segment alignment/proximity/Z-overlap test
+    _opening_matches_any_wall uses to decide a wall actually cut this hole
+    (rather than probing a point in space and checking polygon containment,
+    which is fragile right next to a jog/notch in the room's boundary).
+    Generalized to search every room (not just the opening's own nominal
+    floor) so a manually z_offset half-floor/mezzanine room still matches.
+
+    want_sign: +1 = the wall whose OWN inward normal points the same way as
+    the opening's normal (so the opening's normal points INTO that room --
+    it's the 'to' side); -1 = the opposite (the 'from' side, behind it).
+    Picks the closest-aligned match if more than one room's wall qualifies.
+    Returns a room token, or 'limbo' if nothing matches on that side."""
     s = context.scene.gn_int
-    fi = _floor_idx_for_z(context, (o.sill + o.top) * 0.5)
-    if fi is None:
-        return "limbo", "limbo"
     nrm = Vector((o.nx, o.ny))
     if nrm.length < 1e-6:
-        return "limbo", "limbo"
+        return "limbo"
     nrm = nrm.normalized()
-    center = Vector((o.cx, o.cy))
-    probe = max(o.hw * 0.5, 0.3)
+    best = None
+    for r in s.rooms:
+        fl = _floor_by_index(context, r.floor_index)
+        if not fl:
+            continue
+        base_z, ceil_z, _ = fl
+        base_z += r.z_offset; ceil_z += r.z_offset
+        try:
+            poly = [Vector(p) for p in json.loads(r.poly_json)]
+        except Exception:
+            continue
+        n = len(poly)
+        for i in range(n):
+            A, B = poly[i], poly[(i + 1) % n]
+            d = B - A
+            L = d.length
+            if L < 1e-6:
+                continue
+            d = d / L
+            wn = Vector((-d.y, d.x))
+            align = nrm.dot(wn)
+            if abs(align) < 0.8 or (align > 0) != (want_sign > 0):
+                continue
+            rel = Vector((o.cx, o.cy)) - A
+            x = rel.dot(d)
+            lat = abs(rel.dot(wn))
+            if lat > 0.45 or x < -o.hw or x > L + o.hw:
+                continue
+            z0 = max(base_z, o.sill); z1 = min(ceil_z, o.top)
+            if z1 - z0 <= 0.02:
+                continue
+            if best is None or lat < best[0]:
+                best = (lat, r)
+    if best is None:
+        return "limbo"
+    token = _room_token_for_uid(context, best[1].uid)
+    return token if token is not None else "limbo"
 
-    def token_at(pt):
-        ridx = _room_at_point(context, fi, pt)
-        if ridx < 0:
-            return "limbo"
-        token = _room_token_for_uid(context, s.rooms[ridx].uid)
-        return token if token is not None else "limbo"
 
-    return token_at(center + nrm * probe), token_at(center - nrm * probe)
+def _rooms_for_opening(context, o):
+    """Which two rooms an opening borders. A side with no matching room
+    (facing outdoors) is labelled 'limbo' -- e.g. '1 - limbo' -- matching
+    the real portal-naming convention."""
+    token_to = _wall_room_for_opening(context, o, +1)
+    token_from = _wall_room_for_opening(context, o, -1)
+    return token_to, token_from
 
 
 def _mlo_portals_collection(scene):
@@ -3183,6 +3224,25 @@ class GN_OT_remove_portal(Operator):
         ob = coll.objects[s.portal_index]
         bpy.data.objects.remove(ob, do_unlink=True)
         s.portal_index = max(0, min(s.portal_index, len(coll.objects) - 1))
+        return {'FINISHED'}
+
+
+class GN_OT_clear_portals(Operator):
+    bl_idname = "gn_int.clear_portals"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Clear All Portals"
+    bl_description = "Delete every portal (they're regenerated fresh by Create Portals)"
+
+    def execute(self, context):
+        coll = _mlo_portals_collection(context.scene)
+        if not coll or not coll.objects:
+            self.report({'WARNING'}, "No portals to clear")
+            return {'CANCELLED'}
+        n = len(coll.objects)
+        for ob in list(coll.objects):
+            bpy.data.objects.remove(ob, do_unlink=True)
+        context.scene.gn_int.portal_index = 0
+        self.report({'INFO'}, f"Cleared {n} portal(s)")
         return {'FINISHED'}
 
 
@@ -5098,6 +5158,7 @@ class GN_PT_manual_setup(_PanelBase, Panel):
             row = layout.row(align=True)
             row.operator("gn_int.flip_portal", icon='ARROW_LEFTRIGHT')
             row.operator("gn_int.remove_portal", icon='X')
+            layout.operator("gn_int.clear_portals", icon='TRASH')
             layout.label(text="Click a portal's name in the list to rename it", icon='INFO')
 
 
@@ -5190,7 +5251,7 @@ _classes = (
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_add_room_collections, GN_OT_add_prop_collections, GN_OT_add_asset_collections,
     GN_OT_create_shell_collision,
-    GN_OT_create_portals, GN_OT_remove_portal, GN_OT_flip_portal,
+    GN_OT_create_portals, GN_OT_remove_portal, GN_OT_flip_portal, GN_OT_clear_portals,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
     GN_OT_split_opening_pieces, GN_OT_project_openings, GN_OT_clear_openings,
