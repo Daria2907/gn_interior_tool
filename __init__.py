@@ -1552,6 +1552,152 @@ def split_polygon(poly, A, B, gap):
     return pos, neg
 
 
+def _nearest_edge_param(poly, p):
+    """Closest point on poly's boundary to p -> (edge_index, point_on_edge)."""
+    n = len(poly)
+    best = None
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        e = b - a
+        L2 = e.length_squared
+        t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, (p - a).dot(e) / L2))
+        proj = a + e * t
+        d = (p - proj).length
+        if best is None or d < best[0]:
+            best = (d, i, proj)
+    return best[1], best[2]
+
+
+def _walk_arc(poly, i0, p0, i1, p1):
+    """CCW walk along poly's boundary from p0 (on edge i0) forward to p1 (on
+    edge i1). Returns points including p0 and p1, not closing the loop."""
+    n = len(poly)
+    out = [p0]
+    i = i0
+    while i != i1:
+        i = (i + 1) % n
+        out.append(poly[i])
+    out.append(p1)
+    return out
+
+
+def _line_x_clamped(a, b, c, d, ref, max_dist):
+    """Like _line_x, but returns None (instead of a wild point) if the
+    intersection lands farther than max_dist from `ref`. Two lines meeting
+    at a shallow angle can intersect arbitrarily far away -- this guards
+    against that runaway case (a degenerate multi-hundred-metre sliver)."""
+    p = _line_x(a, b, c, d)
+    if p is None or (p - ref).length > max_dist:
+        return None
+    return p
+
+
+def _offset_line_to_edge(poly, edge_i, seg_a, seg_b, d):
+    """Offset the line through seg_a->seg_b sideways by d, then intersect it
+    with poly's edge `edge_i` -- so the cut's wall-entry point slides along
+    that wall instead of floating off it. Falls back to the nearest point on
+    the edge SEGMENT (not its infinite line) if the two lines are parallel or
+    meet at a shallow angle that would send the intersection far away."""
+    e = seg_b - seg_a
+    L = max(e.length, 1e-6)
+    nrm = Vector((-e.y / L, e.x / L))
+    a2, b2 = seg_a + nrm * d, seg_b + nrm * d
+    ea, eb = poly[edge_i], poly[(edge_i + 1) % len(poly)]
+    ref = seg_a + nrm * d
+    max_dist = max(abs(d) * 8, (eb - ea).length * 2)
+    p = _line_x_clamped(a2, b2, ea, eb, ref, max_dist)
+    if p is not None:
+        return p
+    edge_dir = eb - ea
+    L2 = edge_dir.length_squared
+    t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, (ref - ea).dot(edge_dir) / L2))
+    return ea + edge_dir * t
+
+
+def _offset_polyline_mitered(pts, d):
+    """Offset an OPEN polyline sideways by d; interior vertices mitered via
+    line-intersection (same technique as inset_loop), guarded against a
+    shallow-angle bend sending the miter point far away (falls back to a
+    plain unmitered offset point in that case). Endpoints are handled
+    separately by the caller via _offset_line_to_edge."""
+    segs = []
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        e = b - a
+        L = max(e.length, 1e-6)
+        nrm = Vector((-e.y / L, e.x / L))
+        segs.append((a + nrm * d, b + nrm * d))
+    out = [segs[0][0]]
+    for i in range(len(segs) - 1):
+        ref = pts[i + 1]
+        max_dist = max(abs(d) * 8, (pts[i + 1] - pts[i]).length,
+                       (pts[i + 2] - pts[i + 1]).length)
+        p = _line_x_clamped(segs[i][0], segs[i][1], segs[i + 1][0], segs[i + 1][1],
+                            ref, max_dist)
+        out.append(p if p is not None else segs[i][1])
+    out.append(segs[-1][1])
+    return out
+
+
+def split_polygon_path(poly, path, gap):
+    """Split poly (CCW) by an open polyline `path` (>=2 pts, e.g. an L-shaped
+    cut) whose ends are snapped onto poly's boundary on two DIFFERENT edges.
+    Returns the two pieces pushed apart by `gap`, mitered at interior bends.
+    Either may be [] if the cut is degenerate."""
+    if len(path) < 2:
+        return [], []
+    i0, _ = _nearest_edge_param(poly, path[0])
+    i1, _ = _nearest_edge_param(poly, path[-1])
+    if i0 == i1:
+        return [], []   # both ends on the same wall -- not supported yet
+    h = gap * 0.5
+
+    def offset_chord(d):
+        start = _offset_line_to_edge(poly, i0, path[0], path[1], d)
+        end = _offset_line_to_edge(poly, i1, path[-2], path[-1], d)
+        if len(path) > 2:
+            mid = _offset_polyline_mitered(path, d)
+            return [start] + mid[1:-1] + [end]
+        return [start, end]
+
+    chord_pos = offset_chord(h)
+    chord_neg = offset_chord(-h)
+
+    piece_a = (_walk_arc(poly, i0, chord_neg[0], i1, chord_neg[-1])
+              + list(reversed(chord_neg[1:-1])))
+    piece_b = (_walk_arc(poly, i1, chord_pos[-1], i0, chord_pos[0])
+              + chord_pos[1:-1])
+
+    piece_a = piece_a if len(piece_a) >= 3 and abs(_poly_area(piece_a)) > 0.05 else []
+    piece_b = piece_b if len(piece_b) >= 3 and abs(_poly_area(piece_b)) > 0.05 else []
+    return piece_a, piece_b
+
+
+def split_room_record_path(context, room_idx, path):
+    """Split room[room_idx] by an open polyline (bend cut) with the
+    partition gap. Returns count made (0 or 2)."""
+    s = context.scene.gn_int
+    if not (0 <= room_idx < len(s.rooms)):
+        return 0
+    rec = s.rooms[room_idx]
+    fidx = rec.floor_index
+    try:
+        poly = [Vector(p) for p in json.loads(rec.poly_json)]
+    except Exception:
+        return 0
+    a, b = split_polygon_path(poly, path, s.partition)
+    if not a or not b:
+        return 0
+    s.rooms.remove(room_idx)
+    for part in (a, b):
+        r = s.rooms.add()
+        r.floor_index = fidx
+        r.uid = _new_uid(s)
+        r.poly_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in part])
+    rebuild_rooms(context)
+    return 2
+
+
 def seed_rooms_from_boundaries(context, floor_idx=None):
     """Make one room = the SELECTED floor's whole boundary polygon (all floors
     if floor_idx is None). Rooms on OTHER floors -- including any splits
@@ -2194,6 +2340,101 @@ class GN_OT_split_room(Operator):
             self.report({'INFO'}, "Room split")
         else:
             self.report({'WARNING'}, "Split failed (line must cross the room)")
+
+    def _end(self, context, ok):
+        bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+        context.area.header_text_set(None)
+        context.area.tag_redraw()
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+def _draw_path_overlay(self, context):
+    all_pts = self.pts + ([self.cur] if self.cur is not None else [])
+    if len(all_pts) < 2:
+        return
+    z = self.base_z
+    line_pts = []
+    for i in range(len(all_pts) - 1):
+        a, b = all_pts[i], all_pts[i + 1]
+        line_pts.append((a.x, a.y, z))
+        line_pts.append((b.x, b.y, z))
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'LINES', {"pos": line_pts})
+    gpu.state.line_width_set(3.0)
+    gpu.state.blend_set('ALPHA')
+    shader.bind()
+    shader.uniform_float("color", (1.0, 0.25, 0.85, 1.0))
+    batch.draw(shader)
+    gpu.state.line_width_set(1.0)
+
+
+class GN_OT_split_room_path(Operator):
+    bl_idname = "gn_int.split_room_path"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Split Room (Path)"
+    bl_description = ("Click a bent cut across a room: a wall point, any "
+                      "number of bend points, then a final wall point on a "
+                      "DIFFERENT wall. Enter to finish, Esc/RMB to cancel")
+
+    def invoke(self, context, event):
+        s = context.scene.gn_int
+        self.floor_idx = s.floor_index   # the floor selected in the Floors list
+        fl = _floor_by_index(context, self.floor_idx)
+        if not fl:
+            self.report({'ERROR'}, "Select a floor in the Floors list")
+            return {'CANCELLED'}
+        if not any(r.floor_index == self.floor_idx for r in s.rooms):
+            self.report({'ERROR'}, "No rooms on this floor - click 'Make Floor Walls' first")
+            return {'CANCELLED'}
+        self.base_z = fl[0]
+        self.pts = []
+        self.cur = None
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_path_overlay, (self, context), 'WINDOW', 'POST_VIEW')
+        context.window_manager.modal_handler_add(self)
+        context.area.header_text_set(
+            "Split (Path): click wall point, bend point(s), then opposite wall "
+            "point  |  Enter: finish  |  Esc/RMB: cancel")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        context.area.tag_redraw()
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            hit = _plane_hit(context, event, self.base_z)
+            if hit:
+                self.cur = _snap_pt(Vector((hit.x, hit.y)), context.scene.gn_int.snap)
+            return {'RUNNING_MODAL'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            hit = _plane_hit(context, event, self.base_z)
+            if hit is None:
+                return {'RUNNING_MODAL'}
+            self.pts.append(_snap_pt(Vector((hit.x, hit.y)), context.scene.gn_int.snap))
+            return {'RUNNING_MODAL'}
+        if event.type in {'RET', 'NUMPAD_ENTER'} and event.value == 'PRESS':
+            if len(self.pts) < 2:
+                self.report({'WARNING'}, "Need at least 2 points (start + end wall)")
+                return {'RUNNING_MODAL'}
+            self._commit(context)
+            return self._end(context, True)
+        if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+            return self._end(context, False)
+        return {'RUNNING_MODAL'}
+
+    def _commit(self, context):
+        mid = sum(self.pts, Vector((0.0, 0.0))) / len(self.pts)
+        ridx = _room_at_point(context, self.floor_idx, mid)
+        if ridx < 0:
+            self.report({'WARNING'}, "Path midpoint not inside a room")
+            return
+        made = split_room_record_path(context, ridx, self.pts)
+        if made:
+            self.report({'INFO'}, "Room split")
+        else:
+            self.report({'WARNING'},
+                        "Split failed (path must cross the room, ends on two "
+                        "different walls)")
 
     def _end(self, context, ok):
         bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
@@ -2862,6 +3103,8 @@ class GN_PT_rooms(_PanelBase, Panel):
         layout.prop(s, "partition")
         layout.operator("gn_int.split_edges", icon='MOD_BEVEL')
         layout.label(text="Edit Mode: pick 2 wall edges, then Split", icon='INFO')
+        layout.operator("gn_int.split_room_path", icon='GP_MULTIFRAME_EDITING')
+        layout.label(text="Or click a bent path (L-shape) across a room", icon='INFO')
         layout.label(text=f"{len(s.rooms)} room(s)")
         row = layout.row(align=True)
         row.operator("gn_int.rebuild_rooms", icon='FILE_REFRESH')
@@ -2966,7 +3209,8 @@ _classes = (
     GN_OT_add_floor_z, GN_OT_pick_floor_z,
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
-    GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
+    GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
+    GN_OT_split_edges,
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
