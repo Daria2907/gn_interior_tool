@@ -2396,6 +2396,81 @@ class GN_OT_build_mlo(Operator):
         return {'FINISHED'}
 
 
+def _mlo_room_tokens_all(context):
+    """Every room we know about: rooms still in GN_Rooms (not yet moved into
+    Main) plus any r0N collection that already exists under the MLO -- so
+    these standalone buttons work both for brand-new rooms and for
+    refreshing/extending ones a Build MLO pass already processed."""
+    tokens = set()
+    room_coll = bpy.data.collections.get(ROOM_COLL)
+    if room_coll:
+        tokens.update(ob.name for ob in room_coll.objects)
+    tokens.update(c.name for c in _gn_iter_room_collections(context))
+    return sorted(tokens)
+
+
+class GN_OT_add_room_collections(Operator):
+    bl_idname = "gn_int.add_room_collections"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Room Collections"
+    bl_description = ("Create (or refresh) an r0N collection with RageKit "
+                      "room defaults for every known room")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        tokens = _mlo_room_tokens_all(context)
+        if not tokens:
+            self.report({'WARNING'}, "No rooms found - build rooms or run Build MLO first")
+            return {'CANCELLED'}
+        main_col = _mlo_ensure_scene_collection(f"int_{name}", context.scene)
+        for token in tokens:
+            rcol = _mlo_make_collection(token, main_col)
+            _mlo_apply_room_defaults(rcol, s.timecycle_name)
+        self.report({'INFO'}, f"Room collection(s) ready for {len(tokens)} room(s)")
+        return {'FINISHED'}
+
+
+class GN_OT_add_prop_collections(Operator):
+    bl_idname = "gn_int.add_prop_collections"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Prop Collections"
+    bl_description = "Add a Props_r0N sub-collection to every existing room collection"
+
+    def execute(self, context):
+        rooms = _gn_iter_room_collections(context)
+        if not rooms:
+            self.report({'ERROR'}, "No room collections found - run Add Room Collections first")
+            return {'CANCELLED'}
+        for rcol in rooms:
+            _mlo_make_collection(f"Props_{rcol.name}", rcol)
+        self.report({'INFO'}, f"Props_ sub-collection ready for {len(rooms)} room(s)")
+        return {'FINISHED'}
+
+
+class GN_OT_add_asset_collections(Operator):
+    bl_idname = "gn_int.add_asset_collections"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Asset Collections"
+    bl_description = "Add an Assets_r0N sub-collection to every existing room collection"
+
+    def execute(self, context):
+        rooms = _gn_iter_room_collections(context)
+        if not rooms:
+            self.report({'ERROR'}, "No room collections found - run Add Room Collections first")
+            return {'CANCELLED'}
+        for rcol in rooms:
+            try:
+                _mlo_make_collection(f"Assets_{rcol.name}", rcol).ragequit_type = 'none'
+            except Exception:
+                pass
+        self.report({'INFO'}, f"Assets_ sub-collection ready for {len(rooms)} room(s)")
+        return {'FINISHED'}
+
+
 # ===========================================================================
 # Shell collision (Sollumz BOUND_COMPOSITE -> Shell.BVH -> R##_Shell.poly_mesh)
 # -- same hierarchy/behaviour as the user's scene_organizer.py
@@ -4401,6 +4476,10 @@ class GN_PT_manual_setup(_PanelBase, Panel):
     def draw(self, context):
         layout = self.layout
         layout.label(text="Add anything that wasn't included in Build MLO", icon='INFO')
+        layout.operator("gn_int.add_room_collections", icon='OUTLINER_COLLECTION')
+        layout.operator("gn_int.add_prop_collections", icon='OUTLINER_OB_GROUP_INSTANCE')
+        layout.operator("gn_int.add_asset_collections", icon='ASSET_MANAGER')
+        layout.separator()
         layout.operator("gn_int.create_shell_collision", icon='MESH_ICOSPHERE')
         if GN_OT_create_shell_collision.poll(context) is False:
             layout.label(text="Needs the Sollumz add-on", icon='ERROR')
@@ -4493,7 +4572,9 @@ _classes = (
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
     GN_OT_split_edges,
-    GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo, GN_OT_create_shell_collision,
+    GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
+    GN_OT_add_room_collections, GN_OT_add_prop_collections, GN_OT_add_asset_collections,
+    GN_OT_create_shell_collision,
     GN_OT_create_portals,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
