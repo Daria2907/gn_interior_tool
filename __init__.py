@@ -4177,15 +4177,19 @@ _STAIR_NOSING_ARC_SEGS = 4
 
 
 def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=0.0):
-    """Solid staircase (treads, risers, closed sides, soffit) running from
-    edge (b0,b1) up to edge (t0,t1). Each edge is assumed roughly level (flat
-    at its own Z); the two edges need not be parallel or the same length --
-    the sides taper linearly between them. nosing > 0 rounds the tread's
-    front edge into a small overhanging lip (radius = nosing), recessing the
-    riser to match -- a quarter-circle profile, swept across the width and
-    capped at each side. Returns (verts, faces, cats) in world space --
-    cats parallels faces with a MAT_STAIR_* index per face -- or None if the
-    edges are too close in height or in the travel direction to form a run."""
+    """Solid staircase (treads, risers, closed sides, flat bottom, flat back)
+    running from edge (b0,b1) up to edge (t0,t1). Each edge is assumed
+    roughly level (flat at its own Z); the two edges need not be parallel or
+    the same length -- the sides taper linearly between them. nosing > 0
+    rounds each tread's front edge into a small overhanging lip (radius =
+    nosing), recessing the riser to match -- a quarter-circle profile, swept
+    across the width. The solid is a plain stepped block: flat at z_bot
+    underneath and flat at the back (t=1), NOT a smooth diagonal soffit --
+    that read as a bizarre diagonal wedge cut through every step rather than
+    a normal staircase silhouette. Returns (verts, faces, cats) in world
+    space -- cats parallels faces with a MAT_STAIR_* index per face -- or
+    None if the edges are too close in height or in the travel direction to
+    form a run."""
     b_mid = (b0 + b1) / 2; t_mid = (t0 + t1) / 2
     if t_mid.z < b_mid.z:
         b0, b1, t0, t1 = t0, t1, b0, b1
@@ -4210,6 +4214,13 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         y = bp.y + (tp.y - bp.y) * t
         return x, y
 
+    def fwd(fx, fy, bx, by):
+        v = Vector((bx - fx, by - fy))
+        return v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0))
+
+    thetas = [(k / _STAIR_NOSING_ARC_SEGS) * (math.pi / 2)
+             for k in range(_STAIR_NOSING_ARC_SEGS + 1)]
+
     verts, faces, cats = [], [], []
 
     def quad(a, b, c, d_, cat):
@@ -4224,17 +4235,21 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         faces.append((base, base + 1, base + 2))
         cats.append(cat)
 
+    def step_nosing_r(rise_):
+        return min(nosing, rise_ * 0.9) if nosing > 1e-4 else 0.0
+
+    # treads, risers, and the rounded nosing underside (per step, spanning
+    # the full width from side0 to side1)
     for i in range(n):
         tf, tb = i / n, (i + 1) / n
         zl, zh = z_bot + i * rise, z_bot + (i + 1) * rise
         x0f, y0f = side_xy(b0, t0, tf); x1f, y1f = side_xy(b1, t1, tf)
         x0b, y0b = side_xy(b0, t0, tb); x1b, y1b = side_xy(b1, t1, tb)
-        R = min(nosing, rise * 0.9) if nosing > 1e-4 else 0.0
+        back0, back1 = (x0b, y0b, zh), (x1b, y1b, zh)
+        bot0, bot1 = (x0f, y0f, zl), (x1f, y1f, zl)
+        R = step_nosing_r(rise)
 
         if R > 1e-4:
-            def fwd(fx, fy, bx, by):
-                v = Vector((bx - fx, by - fy))
-                return v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0))
             f0 = fwd(x0f, y0f, x0b, y0b)
             f1 = fwd(x1f, y1f, x1b, y1b)
 
@@ -4243,42 +4258,54 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
                 zz = (zh - R) + R * math.cos(theta)
                 return (fx + f.x * off, fy + f.y * off, zz)
 
-            thetas = [(k / _STAIR_NOSING_ARC_SEGS) * (math.pi / 2)
-                     for k in range(_STAIR_NOSING_ARC_SEGS + 1)]
             arc0 = [arc(x0f, y0f, f0, th) for th in thetas]
             arc1 = [arc(x1f, y1f, f1, th) for th in thetas]
             tip0, tip1 = arc0[0], arc1[0]           # theta=0: flush with tread top
             rec0, rec1 = arc0[-1], arc1[-1]         # theta=90: recessed riser start
-            back0, back1 = (x0b, y0b, zh), (x1b, y1b, zh)
-            bot0, bot1 = (x0f, y0f, zl), (x1f, y1f, zl)
-
-            # tread now runs from the nosing tip back to the tread's back edge
             quad(back0, back1, tip1, tip0, MAT_STAIR_TOP)
-            # the rounded nosing underside, swept across the width
             for k in range(_STAIR_NOSING_ARC_SEGS):
                 quad(arc0[k], arc1[k], arc1[k + 1], arc0[k + 1], MAT_STAIR_SIDE)
-            # riser, starting recessed under the nosing
             quad(bot0, bot1, rec1, rec0, MAT_STAIR_SIDE)
-            # side caps: fan-triangulate the full step outline (tip -> arc ->
-            # recessed -> riser bottom -> tread back -> tip) from back_top,
-            # closing the little gap under the nosing overhang that a single
-            # wedge triangle (the no-nosing case below) would leave open
-            for arc_pts, back_pt, bot_pt in ((arc0, back0, bot0), (arc1, back1, bot1)):
-                tri(back_pt, bot_pt, arc_pts[-1], MAT_STAIR_SIDE)
-                for k in range(_STAIR_NOSING_ARC_SEGS, 0, -1):
-                    tri(back_pt, arc_pts[k], arc_pts[k - 1], MAT_STAIR_SIDE)
         else:
-            # tread (top of the step)
-            quad((x0b, y0b, zh), (x1b, y1b, zh), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
-            # riser (front face of the step)
-            quad((x0f, y0f, zl), (x1f, y1f, zl), (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
-            # side wedges: close the gap between the stepped profile and the
-            # straight incline underneath, on both sides
-            tri((x0f, y0f, zh), (x0f, y0f, zl), (x0b, y0b, zh), MAT_STAIR_SIDE)
-            tri((x1f, y1f, zh), (x1f, y1f, zl), (x1b, y1b, zh), MAT_STAIR_SIDE)
+            quad(back0, back1, (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
+            quad(bot0, bot1, (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
 
-    # soffit -- the single straight incline closing the underside
-    quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top), MAT_STAIR_SIDE)
+    # flat bottom (z_bot, full run) and flat back (t=1, full height) --
+    # a plain block, not a diagonal soffit
+    quad((b0.x, b0.y, z_bot), (b1.x, b1.y, z_bot), (t1.x, t1.y, z_bot), (t0.x, t0.y, z_bot), MAT_STAIR_SIDE)
+    quad((t0.x, t0.y, z_bot), (t1.x, t1.y, z_bot), (t1.x, t1.y, z_top), (t0.x, t0.y, z_top), MAT_STAIR_SIDE)
+
+    # side caps: the stepped silhouette (from the front-bottom corner, up
+    # through every riser/tread/nosing corner, to the top-back corner), then
+    # straight down the back and across the bottom -- fan-triangulated from
+    # the front-bottom corner, which can see every other boundary point
+    # since the whole outline is a simple, non-crossing staircase shape
+    def side_boundary(b, t):
+        pts = [(b.x, b.y, z_bot)]
+        for i in range(n):
+            tf, tb = i / n, (i + 1) / n
+            zl, zh = z_bot + i * rise, z_bot + (i + 1) * rise
+            xf, yf = side_xy(b, t, tf)
+            xb, yb = side_xy(b, t, tb)
+            R = step_nosing_r(rise)
+            if R > 1e-4:
+                f = fwd(xf, yf, xb, yb)
+                for k in range(_STAIR_NOSING_ARC_SEGS, -1, -1):
+                    th = thetas[k]
+                    off = -R + R * math.sin(th)
+                    zz = (zh - R) + R * math.cos(th)
+                    pts.append((xf + f.x * off, yf + f.y * off, zz))
+            else:
+                pts.append((xf, yf, zh))
+            pts.append((xb, yb, zh))
+        pts.append((t.x, t.y, z_bot))
+        return pts
+
+    for b, t in ((b0, t0), (b1, t1)):
+        pts = side_boundary(b, t)
+        for i in range(1, len(pts) - 1):
+            tri(pts[0], pts[i], pts[i + 1], MAT_STAIR_SIDE)
+
     return verts, faces, cats
 
 
