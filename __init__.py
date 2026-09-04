@@ -3088,6 +3088,70 @@ class GN_OT_project_openings(Operator):
         return {'FINISHED'}
 
 
+def _opening_matches_any_wall(context, o):
+    """True if opening o still lines up with a wall edge of some CURRENT room
+    on some floor -- same normal/distance/span test _wall_spans uses to punch
+    the hole. False means the room it was placed on has since been split,
+    resized, or removed out from under it."""
+    s = context.scene.gn_int
+    tops = _floor_tops(context)
+    nrm = Vector((o.nx, o.ny))
+    for r in s.rooms:
+        if not (0 <= r.floor_index < len(tops)):
+            continue
+        base_z, ceil_z, _ = tops[r.floor_index]
+        try:
+            poly = [Vector(p) for p in json.loads(r.poly_json)]
+        except Exception:
+            continue
+        n = len(poly)
+        for i in range(n):
+            A, B = poly[i], poly[(i + 1) % n]
+            d = B - A
+            L = d.length
+            if L < 1e-6:
+                continue
+            d = d / L
+            wn = Vector((-d.y, d.x))
+            if nrm.length > 1e-6 and abs(nrm.normalized().dot(wn)) < 0.8:
+                continue
+            rel = Vector((o.cx, o.cy)) - A
+            x = rel.dot(d)
+            if abs(rel.dot(wn)) > 0.45 or x < -o.hw or x > L + o.hw:
+                continue
+            z0 = max(base_z, o.sill)
+            z1 = min(ceil_z, o.top)
+            if z1 - z0 > 0.02:
+                return True
+    return False
+
+
+class GN_OT_clean_stale_openings(Operator):
+    bl_idname = "gn_int.clean_stale_openings"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Delete Stale Openings"
+    bl_description = ("Delete openings that no longer line up with any current "
+                      "room wall (left behind after a room was split, resized, "
+                      "or its boundary was regenerated). Also removes their "
+                      "door frames/thresholds, then rebuilds rooms")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        stale_idx = [i for i, o in enumerate(s.openings)
+                    if not _opening_matches_any_wall(context, o)]
+        if not stale_idx:
+            self.report({'INFO'}, "No stale openings found")
+            return {'CANCELLED'}
+        for i in reversed(stale_idx):
+            uid = s.openings[i].uid
+            _remove_frame_mesh(uid)
+            _remove_threshold(uid)
+            s.openings.remove(i)
+        rebuild_rooms(context)
+        self.report({'INFO'}, f"Deleted {len(stale_idx)} stale opening(s)")
+        return {'FINISHED'}
+
+
 class GN_OT_clear_openings(Operator):
     bl_idname = "gn_int.clear_openings"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3622,6 +3686,7 @@ class GN_PT_openings(_PanelBase, Panel):
         row = layout.row(align=True)
         row.operator("gn_int.remove_opening", text="Delete Selected", icon='X').index = -1
         row.operator("gn_int.clear_openings", text="Clear All", icon='TRASH')
+        layout.operator("gn_int.clean_stale_openings", icon='ORPHAN_DATA')
 
 
 class GN_PT_doors(_PanelBase, Panel):
@@ -3712,6 +3777,7 @@ _classes = (
     GN_OT_create_portals,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
+    GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo,
