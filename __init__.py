@@ -763,6 +763,46 @@ def _cb_floor_select(self, context):
     bpy.app.timers.register(_do, first_interval=0.0)
 
 
+def _cb_portal_select(self, context):
+    """Selecting a portal in the list selects that object, so the Outliner
+    and viewport highlight what you're looking at. Deferred via a timer for
+    the same undo-reentrancy reason as _cb_floor_select."""
+    scene_name = context.scene.name
+    idx = context.scene.gn_int.portal_index
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        s = scene.gn_int
+        if s.portal_index != idx:
+            return None
+        coll = _mlo_portals_collection(scene)
+        if not coll or not (0 <= idx < len(coll.objects)):
+            return None
+        try:
+            for ob in bpy.context.selectable_objects:
+                ob.select_set(False)
+        except Exception:
+            pass
+        target = coll.objects[idx]
+        try:
+            target.select_set(True)
+            bpy.context.view_layer.objects.active = target
+        except Exception:
+            pass
+        try:
+            for w in bpy.context.window_manager.windows:
+                for a in w.screen.areas:
+                    if a.type == 'VIEW_3D':
+                        a.tag_redraw()
+        except Exception:
+            pass
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
 def _cb_redraw(self, context):
     """Redraw viewports so the selected-opening highlight updates."""
     try:
@@ -799,6 +839,13 @@ def _gn_room_enum_items(self, context):
             for c in _gn_iter_room_collections(context)]
     if not items:
         items.append(("NONE", "-- no rooms found --", "Build MLO Collections first"))
+    return items
+
+
+def _gn_room_enum_items_with_all(self, context):
+    rooms = _gn_iter_room_collections(context)
+    items = [("ALL", "All Rooms", "Add to every room")]
+    items.extend((c.name, c.name, f"Room collection {c.name}") for c in rooms)
     return items
 
 
@@ -854,7 +901,7 @@ class GN_IntProps(PropertyGroup):
     empty_custom_name: StringProperty(name="Custom Name",
         description="Name for a custom empty type", default="")
     empty_target_room: EnumProperty(name="Target Room",
-        description="Room collection to add empties into", items=_gn_room_enum_items)
+        description="Room collection to add empties into", items=_gn_room_enum_items_with_all)
     custom_empties: CollectionProperty(type=GN_CustomEmptyItem)
 
     # ── Smart Rename ────────────────────────────────────────────────────
@@ -911,6 +958,7 @@ class GN_IntProps(PropertyGroup):
     uid_counter: IntProperty(default=1)
     openings: CollectionProperty(type=GN_Opening)
     opening_index: IntProperty(default=0, update=_cb_redraw)
+    portal_index: IntProperty(default=0, update=_cb_portal_select)
     opening_filter: EnumProperty(name="Filter", default='ALL',
         items=[('ALL', "All", "Show all openings"),
                ('DOOR', "Doors", "Show only doors"),
@@ -2909,6 +2957,45 @@ def _rooms_for_opening(context, o):
     return token_at(center + nrm * probe), token_at(center - nrm * probe)
 
 
+def _mlo_portals_collection(scene):
+    """The Portals collection nested under int_<mlo_name>, or None if the
+    MLO / that collection doesn't exist yet."""
+    s = scene.gn_int
+    name = s.mlo_name.strip()
+    if not name:
+        return None
+    main_col = bpy.data.collections.get(f"int_{name}")
+    if not main_col:
+        return None
+    for c in main_col.children:
+        if c.name == "Portals":
+            return c
+    return None
+
+
+class GN_UL_portals(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        layout.label(text=item.name, icon='OUTLINER_OB_LIGHTPROBE')
+
+
+class GN_OT_remove_portal(Operator):
+    bl_idname = "gn_int.remove_portal"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Delete Selected Portal"
+    bl_description = "Delete the selected portal object"
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        coll = _mlo_portals_collection(context.scene)
+        if not coll or not (0 <= s.portal_index < len(coll.objects)):
+            self.report({'WARNING'}, "No portal selected")
+            return {'CANCELLED'}
+        ob = coll.objects[s.portal_index]
+        bpy.data.objects.remove(ob, do_unlink=True)
+        s.portal_index = max(0, min(s.portal_index, len(coll.objects) - 1))
+        return {'FINISHED'}
+
+
 def _spawn_portal(coll, world_positions, name):
     """One Portal quad (magenta, +Y-facing winding) from 4 world corners,
     origin at the quad's centre. Matches scene_organizer.py's _spawn_portal."""
@@ -2953,13 +3040,7 @@ class GN_OT_create_portals(Operator):
             self.report({'ERROR'}, "No openings - run Project Openings first")
             return {'CANCELLED'}
 
-        main_col = bpy.data.collections.get(f"int_{name}")
-        portals_col = None
-        if main_col:
-            for child in main_col.children:
-                if child.name == "Portals":
-                    portals_col = child
-                    break
+        portals_col = _mlo_portals_collection(context.scene)
         if portals_col is None:
             portals_col = _mlo_ensure_scene_collection("Portals", context.scene)
 
@@ -3060,7 +3141,8 @@ class GN_OT_add_empties(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Selected Empties"
     bl_description = ("Add enabled empties to the selected room collection "
-                      "(r01, r02...). Pivot = that room object's own origin")
+                      "(or every room, if 'All Rooms' is picked). Pivot = "
+                      "that room object's own origin")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -3068,17 +3150,25 @@ class GN_OT_add_empties(Operator):
         if not name:
             self.report({'ERROR'}, "Set an MLO Name first")
             return {'CANCELLED'}
-        room_col = bpy.data.collections.get(s.empty_target_room) if s.empty_target_room else None
-        if room_col is None or s.empty_target_room in ("NONE", ""):
-            rooms = _gn_iter_room_collections(context)
-            if not rooms:
+
+        if s.empty_target_room == 'ALL':
+            room_cols = _gn_iter_room_collections(context)
+            if not room_cols:
                 self.report({'ERROR'}, "No room collections found - run Build MLO Collections first")
                 return {'CANCELLED'}
-            room_col = rooms[0]
-            try:
-                s.empty_target_room = room_col.name
-            except Exception:
-                pass
+        else:
+            room_col = bpy.data.collections.get(s.empty_target_room) if s.empty_target_room else None
+            if room_col is None or s.empty_target_room in ("NONE", ""):
+                rooms = _gn_iter_room_collections(context)
+                if not rooms:
+                    self.report({'ERROR'}, "No room collections found - run Build MLO Collections first")
+                    return {'CANCELLED'}
+                room_col = rooms[0]
+                try:
+                    s.empty_target_room = room_col.name
+                except Exception:
+                    pass
+            room_cols = [room_col]
 
         to_create = [p for p in PRESET_EMPTIES if getattr(s, _PRESET_ATTR[p], False)]
         for item in s.custom_empties:
@@ -3088,10 +3178,13 @@ class GN_OT_add_empties(Operator):
             self.report({'WARNING'}, "Tick at least one preset or custom empty above")
             return {'CANCELLED'}
 
-        created = [_gn_create_empty_in_room(room_col, name, room_col.name, t).name
-                  for t in to_create]
-        self.report({'INFO'},
-                    f"Added {len(created)} empty(s) to '{room_col.name}': {', '.join(created)}")
+        total = 0
+        for rc in room_cols:
+            for t in to_create:
+                _gn_create_empty_in_room(rc, name, rc.name, t)
+                total += 1
+        rooms_desc = "every room" if s.empty_target_room == 'ALL' else f"'{room_cols[0].name}'"
+        self.report({'INFO'}, f"Added {total} empty(s) to {rooms_desc}")
         return {'FINISHED'}
 
 
@@ -4484,6 +4577,12 @@ class GN_PT_manual_setup(_PanelBase, Panel):
         if GN_OT_create_shell_collision.poll(context) is False:
             layout.label(text="Needs the Sollumz add-on", icon='ERROR')
         layout.operator("gn_int.create_portals", icon='OUTLINER_OB_LIGHTPROBE')
+        portals_col = _mlo_portals_collection(context.scene)
+        if portals_col and portals_col.objects:
+            layout.label(text=f"{len(portals_col.objects)} portal(s):")
+            layout.template_list("GN_UL_portals", "", portals_col, "objects",
+                                 context.scene.gn_int, "portal_index", rows=4)
+            layout.operator("gn_int.remove_portal", icon='X')
 
 
 class GN_PT_add_empties(_PanelBase, Panel):
@@ -4575,13 +4674,14 @@ _classes = (
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_add_room_collections, GN_OT_add_prop_collections, GN_OT_add_asset_collections,
     GN_OT_create_shell_collision,
-    GN_OT_create_portals,
+    GN_OT_create_portals, GN_OT_remove_portal,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
+    GN_UL_portals,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo, GN_PT_manual_setup,
     GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
