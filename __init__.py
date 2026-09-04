@@ -4417,7 +4417,6 @@ class GN_OT_project_openings(Operator):
         if not pieces:
             self.report({'ERROR'}, "Select the window/door pieces to project first")
             return {'CANCELLED'}
-        floor_bases = [b for (b, _t, _n) in _floor_tops(context)]
         made = skipped = 0
         for o in pieces:
             fr = _piece_frame(o)
@@ -4438,8 +4437,17 @@ class GN_OT_project_openings(Operator):
             op.sill = sill
             op.top = top
             op.projected = True             # exterior piece -> no threshold
-            # a piece that reaches (near) a floor is a door; otherwise a window
-            op.is_door = any(abs(sill - fb) < 0.3 for fb in floor_bases)
+            # a piece that reaches (near) the ACTUAL floor of whichever room(s)
+            # it borders is a door; otherwise a window. Checked against those
+            # specific rooms' own base + z_offset, not any room in the scene --
+            # a half-floor/mezzanine room's floor can coincidentally line up
+            # with some OTHER unrelated room's nominal base
+            bordering = set(_rooms_for_opening(context, op)) - {"limbo"}
+            op.is_door = any(
+                abs(sill - (fl[0] + r.z_offset)) < 0.3
+                for r in s.rooms
+                if _room_token_for_uid(context, r.uid) in bordering
+                and (fl := _floor_by_index(context, r.floor_index)))
             made += 1
         rebuild_rooms(context)
         msg = f"Projected {made} selected opening(s)"
