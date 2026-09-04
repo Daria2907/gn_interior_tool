@@ -673,6 +673,10 @@ class GN_Room(PropertyGroup):
     floor_index: IntProperty(default=0)
     poly_json: StringProperty(default="[]")  # footprint [[x,y],...]
     uid: IntProperty(default=0)              # stable id (survives rebuilds)
+    z_offset: FloatProperty(default=0.0, unit='LENGTH',
+        description="Vertical shift from the floor's own base/top (for a "
+        "half-floor / mezzanine room). Set by grabbing and moving the room "
+        "object in Z -- rebuild_rooms detects and re-applies it")
 
 
 class GN_Opening(PropertyGroup):
@@ -1694,16 +1698,26 @@ def create_room(context, poly_xy, floor_idx):
 
 
 def rebuild_rooms(context):
-    """Rebuild all room shells, PRESERVING each room's visibility (keyed by uid)."""
+    """Rebuild all room shells, PRESERVING each room's visibility (keyed by uid)
+    and Z offset (a manual grab-and-move in Z, e.g. for a half-floor/mezzanine
+    room -- detected from how far the object's centre currently sits from its
+    floor's own base/top, then re-applied so openings still cut at the right
+    height on the next rebuild)."""
     s = context.scene.gn_int
-    # snapshot hide state by uid before clearing
+    # snapshot hide state AND detected z_offset by uid before clearing
     prev = {}
     coll = bpy.data.collections.get(ROOM_COLL)
     if coll:
         for ob in coll.objects:
             u = ob.get("gn_room_uid")
             if u is not None:
-                prev[u] = (ob.hide_get(), ob.hide_render, ob.hide_select)
+                prev[u] = (ob.hide_get(), ob.hide_render, ob.hide_select, ob.location.z)
+    for r in s.rooms:
+        if r.uid in prev:
+            fl = _floor_by_index(context, r.floor_index)
+            if fl:
+                base, top, _ = fl
+                r.z_offset = prev[r.uid][3] - (base + top) * 0.5
     _clear_coll(ROOM_COLL)
     coll = _get_coll(ROOM_COLL)
     for i, r in enumerate(s.rooms):
@@ -1713,6 +1727,7 @@ def rebuild_rooms(context):
         if not fl:
             continue
         base, top, _ = fl
+        base += r.z_offset; top += r.z_offset
         try:
             poly = [Vector(pt) for pt in json.loads(r.poly_json)]
         except Exception:
@@ -1724,7 +1739,7 @@ def rebuild_rooms(context):
                               (s.partition * 0.5 if s.reveal else 0.0), s.uv_scale)
             ob["gn_room_uid"] = r.uid
             if r.uid in prev:                 # restore visibility
-                hv, hr, hs = prev[r.uid]
+                hv, hr, hs, _z = prev[r.uid]
                 ob.hide_set(hv)
                 ob.hide_render = hr
                 ob.hide_select = hs
