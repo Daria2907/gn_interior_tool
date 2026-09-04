@@ -2839,7 +2839,7 @@ def _do_build_shell_collision(context, name, mat_mapping):
 
 # ===========================================================================
 # Portals -- one magenta quad per opening, named "<room> - <room>" (or
-# "<room> - Main" facing the exterior). Same visual/RageKit convention as
+# "<room> - limbo" facing the exterior). Same visual/RageKit convention as
 # scene_organizer.py's Create/Rename Portal, but fully automatic: this tool
 # already knows each opening's position and can look up which room(s) it
 # borders, where scene_organizer needs the user to pick rooms by hand.
@@ -2930,14 +2930,15 @@ def _floor_idx_for_z(context, z):
 def _rooms_for_opening(context, o):
     """Which two rooms an opening borders: sample a point just inside the
     wall on each side of its normal, on the floor matching its Z. A side
-    that isn't inside any room (facing outdoors) is labelled 'Main'."""
+    that isn't inside any room (facing outdoors) is labelled 'limbo' --
+    e.g. '1 - limbo' -- matching the real portal-naming convention."""
     s = context.scene.gn_int
     fi = _floor_idx_for_z(context, (o.sill + o.top) * 0.5)
     if fi is None:
-        return "Main", "Main"
+        return "limbo", "limbo"
     nrm = Vector((o.nx, o.ny))
     if nrm.length < 1e-6:
-        return "Main", "Main"
+        return "limbo", "limbo"
     nrm = nrm.normalized()
     center = Vector((o.cx, o.cy))
     probe = max(o.hw * 0.5, 0.3)
@@ -2946,13 +2947,13 @@ def _rooms_for_opening(context, o):
     def token_at(pt):
         ridx = _room_at_point(context, fi, pt)
         if ridx < 0:
-            return "Main"
+            return "limbo"
         uid = s.rooms[ridx].uid
         if room_coll:
             for ob in room_coll.objects:
                 if ob.get("gn_room_uid") == uid:
                     return _mlo_room_token(ob.name)
-        return "Main"
+        return "limbo"
 
     return token_at(center + nrm * probe), token_at(center - nrm * probe)
 
@@ -3055,7 +3056,7 @@ class GN_OT_create_portals(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Create Portals"
     bl_description = ("Create a Portal quad at every opening, named "
-                      "'<room> - <room>' (or '<room> - Main' facing the "
+                      "'<room> - <room>' (or '<room> - limbo' facing the "
                       "exterior). Safe to re-run: a portal for an opening "
                       "that's already been done is replaced, not duplicated")
 
