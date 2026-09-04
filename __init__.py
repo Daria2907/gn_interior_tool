@@ -1078,6 +1078,7 @@ class GN_IntProps(PropertyGroup):
     openings: CollectionProperty(type=GN_Opening)
     opening_index: IntProperty(default=0, update=_cb_redraw)
     portal_index: IntProperty(default=0, update=_cb_portal_select)
+    show_portal_list: BoolProperty(default=True)
     opening_filter: EnumProperty(name="Filter", default='ALL',
         items=[('ALL', "All", "Show all openings"),
                ('DOOR', "Doors", "Show only doors"),
@@ -5250,14 +5251,19 @@ class GN_PT_manual_setup(_PanelBase, Panel):
         layout.operator("gn_int.create_portals", icon='OUTLINER_OB_LIGHTPROBE')
         portals_col = _mlo_portals_collection(context.scene)
         if portals_col and portals_col.objects:
-            layout.label(text=f"{len(portals_col.objects)} portal(s):")
-            layout.template_list("GN_UL_portals", "", portals_col, "objects",
-                                 context.scene.gn_int, "portal_index", rows=4)
-            row = layout.row(align=True)
-            row.operator("gn_int.flip_portal", icon='ARROW_LEFTRIGHT')
-            row.operator("gn_int.remove_portal", icon='X')
-            layout.operator("gn_int.clear_portals", icon='TRASH')
-            layout.label(text="Click a portal's name in the list to rename it", icon='INFO')
+            s = context.scene.gn_int
+            row = layout.row()
+            row.prop(s, "show_portal_list",
+                     icon='TRIA_DOWN' if s.show_portal_list else 'TRIA_RIGHT',
+                     text=f"{len(portals_col.objects)} portal(s)", emboss=False)
+            if s.show_portal_list:
+                layout.template_list("GN_UL_portals", "", portals_col, "objects",
+                                     s, "portal_index", rows=4)
+                row = layout.row(align=True)
+                row.operator("gn_int.flip_portal", icon='ARROW_LEFTRIGHT')
+                row.operator("gn_int.remove_portal", icon='X')
+                layout.operator("gn_int.clear_portals", icon='TRASH')
+                layout.label(text="Click a portal's name in the list to rename it", icon='INFO')
 
 
 class GN_PT_add_empties(_PanelBase, Panel):
