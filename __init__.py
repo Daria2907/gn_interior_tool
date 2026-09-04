@@ -749,6 +749,37 @@ def _cb_threshold(self, context):
     bpy.app.timers.register(_do, first_interval=0.0)
 
 
+def _cb_stair_settings(self, context):
+    """Live-rebuild the selected stair(s) when Step Height/Depth changes.
+    _rebuild_stair_mesh is defined later in the file (near the rest of the
+    stairs feature) -- fine, since a function body only resolves names at
+    CALL time, and by then the whole module has finished loading.
+
+    Deferred via a timer for the same reentrancy reason as _cb_threshold
+    above: rebuilding objects directly inside a property update callback can
+    crash Blender if it fires while undo/redo is being processed.
+    """
+    if _SUSPEND_CB:
+        return
+    names = [ob.name for ob in context.selected_objects
+             if ob.type == 'MESH' and "gn_stair_data" in ob]
+    if not names:
+        return
+    height, depth = self.stair_step_height, self.stair_step_depth
+
+    def _do():
+        for nm in names:
+            ob = bpy.data.objects.get(nm)
+            if ob:
+                try:
+                    _rebuild_stair_mesh(ob, height, depth)
+                except Exception as e:
+                    print("[GN Interior] stair update:", e)
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
 def _cb_floor_select(self, context):
     """Selecting a floor in the list selects its boundary + rooms in the
     scene, so the Outliner and viewport highlight what you're looking at.
@@ -1033,11 +1064,15 @@ class GN_IntProps(PropertyGroup):
     stair_step_height: FloatProperty(name="Step Height", default=0.18,
         min=0.02, max=0.5, unit='LENGTH',
         description="Target riser height per step (actual may come out lower "
-        "to divide the run evenly)")
+        "to divide the run evenly). Also live-updates any selected, "
+        "already-created stairs",
+        update=_cb_stair_settings)
     stair_step_depth: FloatProperty(name="Step Depth", default=0.28,
         min=0.05, max=1.0, unit='LENGTH',
         description="Target tread depth per step (actual may come out lower "
-        "to divide the run evenly)")
+        "to divide the run evenly). Also live-updates any selected, "
+        "already-created stairs",
+        update=_cb_stair_settings)
 
 
 # ===========================================================================
@@ -4020,6 +4055,46 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth):
     return verts, faces
 
 
+def _apply_stair_mesh(ob, verts, faces):
+    """Write world-space verts/faces (from _build_stairs_between_edges) into
+    ob's existing mesh data, converting through the object's CURRENT
+    matrix_world (so this still works if the stair object has been moved or
+    rotated since it was created)."""
+    mw_inv = ob.matrix_world.inverted()
+    bm = bmesh.new()
+    bverts = [bm.verts.new(mw_inv @ Vector(v)) for v in verts]
+    for f in faces:
+        try:
+            bm.faces.new([bverts[i] for i in f])
+        except ValueError:
+            pass
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    bm.to_mesh(ob.data)
+    bm.free()
+    ob.data.update()
+
+
+def _rebuild_stair_mesh(ob, height, depth):
+    """Re-run the stair build for an EXISTING stair object at new
+    height/depth settings, using the original two edges stored on it at
+    creation time. Returns True if ob was a stair and got rebuilt."""
+    raw = ob.get("gn_stair_data")
+    if not raw:
+        return False
+    try:
+        d = json.loads(raw)
+        b0, b1 = Vector(d["b0"]), Vector(d["b1"])
+        t0, t1 = Vector(d["t0"]), Vector(d["t1"])
+    except Exception:
+        return False
+    built = _build_stairs_between_edges(b0, b1, t0, t1, height, depth)
+    if not built:
+        return False
+    _apply_stair_mesh(ob, *built)
+    return True
+
+
 class GN_OT_create_stairs(Operator):
     bl_idname = "gn_int.create_stairs"
     bl_options = {'REGISTER', 'UNDO'}
@@ -4045,24 +4120,15 @@ class GN_OT_create_stairs(Operator):
         if not built:
             self.report({'ERROR'}, "The two edges are too close together (in height or distance) to build a run")
             return {'CANCELLED'}
-        verts, faces = built
         bpy.ops.object.mode_set(mode='OBJECT')
-        bm = bmesh.new()
-        bverts = [bm.verts.new(v) for v in verts]
-        for f in faces:
-            try:
-                bm.faces.new([bverts[i] for i in f])
-            except ValueError:
-                pass
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
         coll = _get_coll(STAIR_COLL)
         name = f"GN_Stairs.{len(coll.objects):03d}"
         me = bpy.data.meshes.new(name)
-        bm.to_mesh(me)
-        bm.free()
         ob = bpy.data.objects.new(name, me)
         coll.objects.link(ob)
+        _apply_stair_mesh(ob, *built)
+        ob["gn_stair_data"] = json.dumps({
+            "b0": list(b0), "b1": list(b1), "t0": list(t0), "t1": list(t1)})
         context.view_layer.objects.active = ob
         bpy.ops.object.select_all(action='DESELECT')
         ob.select_set(True)
