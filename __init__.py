@@ -1399,7 +1399,7 @@ class GN_OT_clean_interior(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clean Interior Tool (New Building)"
     bl_description = ("Reset for a different building: clears the exterior "
-                      "reference, floors, rooms, openings, and generated "
+                      "reference, floors, rooms, openings, stairs, generated "
                       "boundaries, and the MLO name fields. Does NOT touch any "
                       "MLO collections already built (int_<name> etc) -- use "
                       "Clean MLO for that first if you want those gone too")
@@ -1422,6 +1422,8 @@ class GN_OT_clean_interior(Operator):
         _clear_coll(WINDOWFRAME_COLL)
         _clear_coll(THRESHOLD_COLL)
         _clear_coll(INT_COLL)
+        _clear_coll(STAIR_COLL)
+        _clear_coll(OPENING_PIECES_COLL)
         self.report({'INFO'}, "Interior Tool reset - set a new exterior shell to start")
         return {'FINISHED'}
 
@@ -5313,7 +5315,7 @@ def _dump_scene(scene):
         "floors": [{"z": f.z, "top": f.top, "top_is_custom": f.top_is_custom,
                     "bound_json": f.bound_json, "lock": f.lock} for f in s.floors],
         "rooms": [{"floor_index": r.floor_index, "uid": r.uid,
-                   "poly_json": r.poly_json} for r in s.rooms],
+                   "poly_json": r.poly_json, "z_offset": r.z_offset} for r in s.rooms],
         "openings": [{k: getattr(o, k) for k in
                       ("cx", "cy", "nx", "ny", "hw", "sill", "top", "uid",
                        "is_door", "projected")}
@@ -5361,6 +5363,7 @@ def _restore_scene(scene):
     for r in data.get("rooms", []):
         it = s.rooms.add()
         it.floor_index = r["floor_index"]; it.uid = r["uid"]; it.poly_json = r["poly_json"]
+        it.z_offset = r.get("z_offset", 0.0)
     s.openings.clear()
     for o in data.get("openings", []):
         it = s.openings.add()
