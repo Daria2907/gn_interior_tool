@@ -482,6 +482,37 @@ def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=Fa
     surv = [r for r in runs if keep(r)]
     if len(surv) < 4:
         surv = [r for r in runs if r[2] >= min_edge] or runs
+
+    def parallel_same_way(a, b):
+        (ax, ay), (bx, by) = a[1], b[1]
+        cross = ax * by - ay * bx
+        dot = ax * bx + ay * by
+        return abs(cross) < 1e-4 and dot > 0.5
+
+    def merge_runs(a, b):
+        wsum = a[2] + b[2]
+        mx = (a[0][0] * a[2] + b[0][0] * b[2]) / wsum
+        my = (a[0][1] * a[2] + b[0][1] * b[2]) / wsum
+        return [(mx, my), a[1], wsum, a[3] or b[3]]
+
+    # Dropping a short corner chamfer leaves two flanking runs that are
+    # PARALLEL (a raster staircase along one straight wall), not
+    # perpendicular (a real corner) -- those can't be joined by
+    # intersection, so without this they'd stay linked point-to-point as a
+    # fake jog. Merge any such adjacent parallel runs into one.
+    changed = True
+    while changed and len(surv) > 1:
+        changed = False
+        ns = len(surv)
+        for i in range(ns):
+            if parallel_same_way(surv[i - 1], surv[i]):
+                merged = merge_runs(surv[i - 1], surv[i])
+                if i == 0:
+                    surv = [merged] + surv[1:-1]
+                else:
+                    surv = surv[:i - 1] + [merged] + surv[i + 1:]
+                changed = True
+                break
     out = []
     for i in range(len(surv)):
         p = _line_isect(surv[i - 1][0], surv[i - 1][1], surv[i][0], surv[i][1])
