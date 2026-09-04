@@ -800,6 +800,11 @@ class GN_IntProps(PropertyGroup):
     uv_scale: FloatProperty(name="UV Scale", default=2.0, min=0.05, max=20.0,
         unit='LENGTH', description="Cube-UV texture size: a texture tiles every "
         "this many metres")
+    mlo_name: StringProperty(name="MLO Name", default="",
+        description="Interior name -> collection 'int_<name>', shell empty "
+        "'<name>_shell'. Run this once, after rooms/doors are finished")
+    timecycle_name: StringProperty(name="Timecycle", default="",
+        description="RageKit room timecycle name (optional)")
     floors: CollectionProperty(type=GN_FloorLevel)
     new_floor_z: FloatProperty(name="Z", default=0.0, unit='LENGTH',
         description="Base Z for the next floor added via 'Add Floor at Z'")
@@ -1798,6 +1803,189 @@ class GN_OT_reunwrap(Operator):
         return {'FINISHED'}
 
 
+# ===========================================================================
+# MLO setup (RageKit ytyp/room collections) -- run once, after rooms/doors
+# are finished. Mirrors the conventions in the user's scene_organizer.py.
+# ===========================================================================
+def _mlo_free_collection_name(name):
+    existing = bpy.data.collections.get(name)
+    if existing is None:
+        return
+    for scene in bpy.data.scenes:
+        if existing in list(scene.collection.children):
+            scene.collection.children.unlink(existing)
+    for col in list(bpy.data.collections):
+        if existing.name in [c.name for c in col.children]:
+            try:
+                col.children.unlink(existing)
+            except Exception:
+                pass
+    bpy.data.collections.remove(existing)
+
+
+def _mlo_ensure_scene_collection(name, scene):
+    for child in scene.collection.children:
+        if child.name == name:
+            return child
+    _mlo_free_collection_name(name)
+    col = bpy.data.collections.new(name)
+    scene.collection.children.link(col)
+    return col
+
+
+def _mlo_make_collection(name, parent):
+    for child in parent.children:
+        if child.name == name:
+            return child
+    _mlo_free_collection_name(name)
+    col = bpy.data.collections.new(name)
+    parent.children.link(col)
+    return col
+
+
+def _mlo_apply_ytyp(col):
+    try:
+        col.ragequit_type = 'ytyp'
+        col.ragequit_ytyp.lodDist = 200
+        col.ragequit_ytyp.hdTextureDist = 100
+    except Exception:
+        pass
+
+
+def _mlo_apply_room_defaults(col, timecycle_name):
+    try:
+        col.ragequit_type = 'room'
+        room = col.ragequit_room
+        room.timecycleName = timecycle_name
+        room.floorId = 0
+        room.bounds_mode = 'AUTO'
+    except Exception:
+        pass
+
+
+def _mlo_apply_collection_types(main_col):
+    special = {'Collisions': 'collision', 'Portals': 'portals', 'Assets': 'assets'}
+    for child in main_col.children:
+        try:
+            child.ragequit_type = special.get(child.name, 'room')
+            if child.ragequit_type == 'room':
+                for sub in child.children:
+                    if sub.name.startswith("Props_"):
+                        sub.ragequit_type = 'room_props'
+        except Exception:
+            pass
+
+
+class GN_OT_build_mlo(Operator):
+    bl_idname = "gn_int.build_mlo"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Build / Update MLO Collections"
+    bl_description = ("Create (or update) the int_<name> collection structure. "
+                      "Each room mesh currently in GN_Rooms is renamed to "
+                      "<name>_r0N_shell.model, moved into Main, and parented to "
+                      "the shell empty; its r0N collection is left holding fresh "
+                      "Props_/Assets_ subfolders. Safe to re-run: only rooms "
+                      "still in GN_Rooms are processed, so it's the same button "
+                      "for adding new rooms later or replacing a rebuilt one -- "
+                      "everything already moved into Main is left alone")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        room_coll = bpy.data.collections.get(ROOM_COLL)
+        if not room_coll or not room_coll.objects:
+            self.report({'ERROR'}, "No built rooms - run Make Floor Walls first")
+            return {'CANCELLED'}
+
+        main_col = _mlo_ensure_scene_collection(f"int_{name}", context.scene)
+        _mlo_apply_ytyp(main_col)
+        try:
+            _mlo_make_collection("Collisions", main_col).ragequit_type = 'collision'
+        except Exception:
+            pass
+        try:
+            _mlo_make_collection("Portals", main_col).ragequit_type = 'portals'
+        except Exception:
+            pass
+        assets = _mlo_make_collection("Assets", main_col)
+        try:
+            assets.ragequit_type = 'assets'
+        except Exception:
+            pass
+        doors = _mlo_make_collection("Doors", assets)   # nested INSIDE Assets
+        try:
+            doors.ragequit_type = 'assets'
+        except Exception:
+            pass
+
+        # Main: shell empty, at world origin
+        main_room = _mlo_make_collection("Main", main_col)
+        _mlo_apply_room_defaults(main_room, s.timecycle_name)
+        empty_name = f"{name}_shell"
+        empty = bpy.data.objects.get(empty_name)
+        if empty is None:
+            empty = bpy.data.objects.new(empty_name, None)
+            empty.empty_display_type = 'PLAIN_AXES'
+            empty.location = (0.0, 0.0, 0.0)
+        if empty.name not in main_room.objects:
+            main_room.objects.link(empty)
+        for col in list(empty.users_collection):
+            if col is not main_room:
+                col.objects.unlink(empty)
+
+        # each built room -> rename to <name>_r0N_shell.model, move into Main,
+        # parent to the shell empty; the room's own collection gets fresh
+        # Props_/Assets_ subfolders (matching int_gn_hq_triad / int_gn_legion_bank)
+        moved = 0
+        replaced = 0
+        for ob in list(room_coll.objects):
+            room_token = ob.name
+            rcol = _mlo_make_collection(room_token, main_col)
+            _mlo_apply_room_defaults(rcol, s.timecycle_name)
+            _mlo_make_collection(f"Props_{room_token}", rcol)
+            try:
+                _mlo_make_collection(f"Assets_{room_token}", rcol).ragequit_type = 'none'
+            except Exception:
+                pass
+
+            new_name = f"{name}_{room_token}_shell.model"
+            existing = bpy.data.objects.get(new_name)
+            if existing is not None and existing is not ob and existing.name in main_room.objects:
+                # a room rebuilt after an earlier MLO build (same room_token,
+                # new mesh) -- the old shell is stale, replace it cleanly
+                bpy.data.objects.remove(existing, do_unlink=True)
+                replaced += 1
+                existing = None
+            if existing is not None and existing is not ob:
+                counter = 1
+                while bpy.data.objects.get(
+                        f"{name}_{room_token}_shell_{counter:02d}.model") not in (None, ob):
+                    counter += 1
+                new_name = f"{name}_{room_token}_shell_{counter:02d}.model"
+            ob.name = new_name
+            if ob.data:
+                ob.data.name = new_name
+
+            world_mat = ob.matrix_world.copy()
+            for col in list(ob.users_collection):
+                col.objects.unlink(ob)
+            main_room.objects.link(ob)
+            ob.parent = empty
+            ob.matrix_parent_inverse = Matrix.Identity(4)
+            ob.matrix_world = world_mat
+            moved += 1
+
+        _mlo_apply_collection_types(main_col)
+        msg = f"Built int_{name} with {moved} room shell(s)"
+        if replaced:
+            msg += f" ({replaced} rebuilt room(s) replaced)"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class GN_OT_clear_rooms(Operator):
     bl_idname = "gn_int.clear_rooms"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2658,6 +2846,20 @@ class GN_PT_windows(_PanelBase, Panel):
                         icon='GREASEPENCIL').kind = 'WINDOW'
 
 
+class GN_PT_mlo(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_interior"
+    bl_label = "MLO Setup"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        layout.label(text="Run once, after rooms/doors are finished", icon='INFO')
+        layout.prop(s, "mlo_name")
+        layout.prop(s, "timecycle_name")
+        layout.operator("gn_int.build_mlo", icon='OUTLINER_COLLECTION')
+
+
 # ===========================================================================
 _classes = (
     GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset, GN_IntProps,
@@ -2666,12 +2868,12 @@ _classes = (
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
-    GN_OT_reunwrap,
+    GN_OT_reunwrap, GN_OT_build_mlo,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
-    GN_PT_openings, GN_PT_doors, GN_PT_windows,
+    GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo,
 )
 
 
@@ -2680,7 +2882,8 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
                   "allow45", "partition", "reveal", "uid_counter", "uv_scale",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
-                  "threshold_depth", "threshold_flip", "threshold_offset")
+                  "threshold_depth", "threshold_flip", "threshold_offset",
+                  "mlo_name", "timecycle_name")
 
 
 def _dump_scene(scene):
