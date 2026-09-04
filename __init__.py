@@ -1263,6 +1263,37 @@ class GN_OT_clear(Operator):
         return {'FINISHED'}
 
 
+class GN_OT_clean_interior(Operator):
+    bl_idname = "gn_int.clean_interior"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Clean Interior Tool (New Building)"
+    bl_description = ("Reset for a different building: clears the exterior "
+                      "reference, floors, rooms, openings, and generated "
+                      "boundaries, and the MLO name fields. Does NOT touch any "
+                      "MLO collections already built (int_<name> etc) -- use "
+                      "Clean MLO for that first if you want those gone too")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        s.exterior = None
+        s.floors.clear()
+        s.rooms.clear()
+        s.openings.clear()
+        s.mlo_name = ""
+        s.timecycle_name = ""
+        _clear_coll(BOUND_COLL)
+        _clear_coll(ROOM_COLL)
+        _clear_coll(DOORFRAME_COLL)
+        _clear_coll(WINDOWFRAME_COLL)
+        _clear_coll(THRESHOLD_COLL)
+        _clear_coll(INT_COLL)
+        self.report({'INFO'}, "Interior Tool reset - set a new exterior shell to start")
+        return {'FINISHED'}
+
+
 # ---- mesh builders --------------------------------------------------------
 def _make_loop_object(coll, name, poly_xy, z):
     bm = bmesh.new()
@@ -4431,6 +4462,9 @@ class GN_PT_interior(_PanelBase, Panel):
         row = self.layout.row(align=True)
         row.prop(s, "exterior", text="Shell")
         row.operator("gn_int.set_exterior", text="", icon='EYEDROPPER')
+        row = self.layout.row()
+        row.alert = True
+        row.operator("gn_int.clean_interior", icon='TRASH')
 
 
 class GN_PT_setup(_PanelBase, Panel):
@@ -4700,7 +4734,7 @@ _classes = (
     GN_CollMatSearchItem, GN_ShellCollMappingItem,
     GN_OT_set_exterior, GN_OT_add_floor_sel,
     GN_OT_add_floor_z, GN_OT_pick_floor_z,
-    GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
+    GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear, GN_OT_clean_interior,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
     GN_OT_split_edges,
