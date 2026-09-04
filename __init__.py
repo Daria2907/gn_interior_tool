@@ -3120,24 +3120,29 @@ def _room_token_for_uid(context, uid):
     return None
 
 
-def _wall_room_for_opening(context, o, want_sign):
-    """The room bordering this opening on one particular side, found by the
-    SAME wall-segment alignment/proximity/Z-overlap test
-    _opening_matches_any_wall uses to decide a wall actually cut this hole
-    (rather than probing a point in space and checking polygon containment,
-    which is fragile right next to a jog/notch in the room's boundary).
-    Generalized to search every room (not just the opening's own nominal
-    floor) so a manually z_offset half-floor/mezzanine room still matches.
+def _wall_match_for_opening(context, o, want_sign):
+    """Full match details for one side of an opening, found by the SAME
+    wall-segment alignment/proximity/Z-overlap test _opening_matches_any_wall
+    uses to decide a wall actually cut this hole (rather than probing a
+    point in space and checking polygon containment, which is fragile right
+    next to a jog/notch in the room's boundary). Generalized to search every
+    room (not just the opening's own nominal floor) so a manually z_offset
+    half-floor/mezzanine room still matches.
 
     want_sign: +1 = the wall whose OWN inward normal points the same way as
     the opening's normal (so the opening's normal points INTO that room --
     it's the 'to' side); -1 = the opposite (the 'from' side, behind it).
     Picks the closest-aligned match if more than one room's wall qualifies.
-    Returns a room token, or 'limbo' if nothing matches on that side."""
+
+    Returns (room, wn, wall_pt) or None. wall_pt is the opening's centre
+    PROJECTED onto the wall's own line -- an opening's stored (cx, cy) can
+    sit off that line by however thick the original window/door piece it
+    was projected from was, so anything measuring outward FROM the wall
+    (like a reveal depth) needs to start at wall_pt, not (o.cx, o.cy)."""
     s = context.scene.gn_int
     nrm = Vector((o.nx, o.ny))
     if nrm.length < 1e-6:
-        return "limbo"
+        return None
     nrm = nrm.normalized()
     best = None
     for r in s.rooms:
@@ -3171,10 +3176,20 @@ def _wall_room_for_opening(context, o, want_sign):
             if z1 - z0 <= 0.02:
                 continue
             if best is None or lat < best[0]:
-                best = (lat, r)
+                best = (lat, r, wn, A + d * x)
     if best is None:
+        return None
+    _, r, wn, wall_pt = best
+    return r, wn, wall_pt
+
+
+def _wall_room_for_opening(context, o, want_sign):
+    """Room token for one side of an opening (see _wall_match_for_opening),
+    or 'limbo' if nothing matches on that side."""
+    m = _wall_match_for_opening(context, o, want_sign)
+    if m is None:
         return "limbo"
-    token = _room_token_for_uid(context, best[1].uid)
+    token = _room_token_for_uid(context, m[0].uid)
     return token if token is not None else "limbo"
 
 
@@ -3349,22 +3364,24 @@ class GN_OT_create_portals(Operator):
             portal_name = f"{token_from} - {token_to}"
 
             # A room's wall reveal (Boundary cleanup > win/door reveal) is
-            # extruded OUTWARD from this same hole rectangle, away from that
+            # extruded OUTWARD from the wall's own hole, away from that
             # room, by _build_wall -- so at a room/limbo boundary the portal
-            # (sitting at the raw hole) reads as recessed behind that jamb.
-            # Push it out to the jamb's outer rim, toward whichever side is
-            # limbo. A room-to-room opening needs no shift: both sides'
-            # jambs already meet exactly at the raw centre.
+            # needs to sit at that jamb's outer rim, not the raw opening
+            # centre. Two things the raw centre can't be trusted for here:
+            # it can sit off the wall's actual line by however thick the
+            # projected window/door piece was (_wall_match_for_opening's
+            # wall_pt corrects that), and the reveal itself is measured
+            # outward FROM that line, not from the (possibly offset) centre.
+            # A room-to-room opening needs no shift: both sides' jambs
+            # already meet exactly at the centre by construction.
             rd = 0.0
             if s.reveal:
                 rd = (s.partition * 0.5) if o.is_door else s.wall_margin
-            shift = Vector((0.0, 0.0))
-            if rd > 1e-4:
-                if token_to == "limbo" and token_from != "limbo":
-                    shift = nrm * rd
-                elif token_from == "limbo" and token_to != "limbo":
-                    shift = -nrm * rd
-            c = c + shift
+            if rd > 1e-4 and (token_to == "limbo") != (token_from == "limbo"):
+                m = _wall_match_for_opening(context, o, -1 if token_to == "limbo" else +1)
+                if m:
+                    _, wn, wall_pt = m
+                    c = wall_pt + (-wn) * rd
             corners = [
                 Vector(((c - tangent * o.hw).x, (c - tangent * o.hw).y, o.sill)),
                 Vector(((c + tangent * o.hw).x, (c + tangent * o.hw).y, o.sill)),
