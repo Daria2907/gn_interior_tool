@@ -815,8 +815,6 @@ class GN_IntProps(PropertyGroup):
         unit='LENGTH', description="Inset from exterior walls to interior walls")
     room_height: FloatProperty(name="Room Height", default=2.95, min=0.5, max=10.0,
         unit='LENGTH', description="Fixed interior clear height per floor")
-    floor_gap: FloatProperty(name="Floor Gap", default=0.10, min=0.0, max=2.0,
-        unit='LENGTH', description="Minimum gap between a ceiling and the floor above")
     sample_offset: FloatProperty(name="Sample Height", default=1.0, min=0.05, max=5.0,
         unit='LENGTH', description="Height above each floor base to cut the outline "
         "(pick a solid wall band, between windows)")
@@ -881,6 +879,24 @@ class GN_IntProps(PropertyGroup):
     auto_collision: BoolProperty(name="Auto Collision",
         description="Also build a .poly_mesh collision copy with guessed "
         "collision materials per slot", default=True)
+
+    # ── Build MLO popup: what to include ───────────────────────────────
+    build_main: BoolProperty(name="Main", default=True,
+        description="Shell empty + per-room shell meshes")
+    build_room_colls: BoolProperty(name="Room Collections", default=True,
+        description="r01, r02... collections with RageKit room defaults")
+    build_prop_colls: BoolProperty(name="Prop Collections", default=True,
+        description="Props_r0N sub-collection per room")
+    build_asset_colls: BoolProperty(name="Asset Collections", default=True,
+        description="Assets_r0N sub-collection per room")
+    build_shell_collision: BoolProperty(name="Shell Collision", default=False,
+        description="Auto-guessed collision materials (needs Sollumz) -- use "
+        "Manual Setup afterward to review/change the per-material mapping")
+    build_portals: BoolProperty(name="Auto Make Portals", default=False,
+        description="One portal per opening, named by the rooms it borders")
+    build_empties: BoolProperty(name="Add Empties", default=False,
+        description="Add the ticked presets below (Manual Setup > Add Empties) "
+        "to every room")
 
     floors: CollectionProperty(type=GN_FloorLevel)
     new_floor_z: FloatProperty(name="Z", default=0.0, unit='LENGTH',
@@ -1025,7 +1041,7 @@ class GN_OT_pick_floor_z(Operator):
         if s.floors:
             top_floor = max(s.floors, key=lambda f: f.z)
             start = (top_floor.top if top_floor.top_is_custom else
-                     top_floor.z + s.room_height) + s.floor_gap
+                     top_floor.z + s.room_height)
         else:
             start = min((ex.matrix_world @ v.co).z for v in ex.data.vertices)
         self._z = start
@@ -2197,15 +2213,28 @@ class GN_OT_clean_mlo(Operator):
 class GN_OT_build_mlo(Operator):
     bl_idname = "gn_int.build_mlo"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Build / Update MLO Collections"
+    bl_label = "Build MLO"
     bl_description = ("Create (or update) the int_<name> collection structure. "
-                      "Each room mesh currently in GN_Rooms is renamed to "
-                      "<name>_r0N_shell.model, moved into Main, and parented to "
-                      "the shell empty; its r0N collection is left holding fresh "
-                      "Props_/Assets_ subfolders. Safe to re-run: only rooms "
-                      "still in GN_Rooms are processed, so it's the same button "
-                      "for adding new rooms later or replacing a rebuilt one -- "
-                      "everything already moved into Main is left alone")
+                      "Pick what to include -- anything left unticked can be "
+                      "added later from Manual Setup below")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=280)
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        col = self.layout.column(align=True)
+        col.prop(s, "build_main")
+        col.prop(s, "build_room_colls")
+        sub = col.column(align=True)
+        sub.enabled = s.build_room_colls
+        sub.prop(s, "build_prop_colls")
+        sub.prop(s, "build_asset_colls")
+        self.layout.separator()
+        col2 = self.layout.column(align=True)
+        col2.prop(s, "build_shell_collision")
+        col2.prop(s, "build_portals")
+        col2.prop(s, "build_empties")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -2213,8 +2242,10 @@ class GN_OT_build_mlo(Operator):
         if not name:
             self.report({'ERROR'}, "Set an MLO Name first")
             return {'CANCELLED'}
+        needs_rooms = (s.build_main or s.build_room_colls
+                      or s.build_prop_colls or s.build_asset_colls)
         room_coll = bpy.data.collections.get(ROOM_COLL)
-        if not room_coll or not room_coll.objects:
+        if needs_rooms and (not room_coll or not room_coll.objects):
             self.report({'ERROR'}, "No built rooms - run Make Floor Walls first")
             return {'CANCELLED'}
 
@@ -2239,35 +2270,46 @@ class GN_OT_build_mlo(Operator):
         except Exception:
             pass
 
-        # Main: shell empty, at world origin
-        main_room = _mlo_make_collection("Main", main_col)
-        _mlo_apply_room_defaults(main_room, s.timecycle_name)
-        empty_name = f"{name}_shell"
-        empty = bpy.data.objects.get(empty_name)
-        if empty is None:
-            empty = bpy.data.objects.new(empty_name, None)
-            empty.empty_display_type = 'PLAIN_AXES'
-            empty.location = (0.0, 0.0, 0.0)
-        if empty.name not in main_room.objects:
-            main_room.objects.link(empty)
-        for col in list(empty.users_collection):
-            if col is not main_room:
-                col.objects.unlink(empty)
+        empty = None
+        main_room = None
+        if s.build_main:
+            main_room = _mlo_make_collection("Main", main_col)
+            _mlo_apply_room_defaults(main_room, s.timecycle_name)
+            empty_name = f"{name}_shell"
+            empty = bpy.data.objects.get(empty_name)
+            if empty is None:
+                empty = bpy.data.objects.new(empty_name, None)
+                empty.empty_display_type = 'PLAIN_AXES'
+                empty.location = (0.0, 0.0, 0.0)
+            if empty.name not in main_room.objects:
+                main_room.objects.link(empty)
+            for col in list(empty.users_collection):
+                if col is not main_room:
+                    col.objects.unlink(empty)
 
-        # each built room -> rename to <name>_r0N_shell.model, move into Main,
-        # parent to the shell empty; the room's own collection gets fresh
-        # Props_/Assets_ subfolders (matching int_gn_hq_triad / int_gn_legion_bank)
+        # each built room: optionally get an r0N collection (+ Props_/Assets_
+        # subfolders), and optionally have its shell mesh renamed and moved
+        # into Main (matching int_gn_hq_triad / int_gn_legion_bank)
         moved = 0
         replaced = 0
-        for ob in list(room_coll.objects):
+        built_room_tokens = []
+        for ob in list(room_coll.objects) if room_coll else []:
             room_token = ob.name
-            rcol = _mlo_make_collection(room_token, main_col)
-            _mlo_apply_room_defaults(rcol, s.timecycle_name)
-            _mlo_make_collection(f"Props_{room_token}", rcol)
-            try:
-                _mlo_make_collection(f"Assets_{room_token}", rcol).ragequit_type = 'none'
-            except Exception:
-                pass
+            built_room_tokens.append(room_token)
+
+            if s.build_room_colls:
+                rcol = _mlo_make_collection(room_token, main_col)
+                _mlo_apply_room_defaults(rcol, s.timecycle_name)
+                if s.build_prop_colls:
+                    _mlo_make_collection(f"Props_{room_token}", rcol)
+                if s.build_asset_colls:
+                    try:
+                        _mlo_make_collection(f"Assets_{room_token}", rcol).ragequit_type = 'none'
+                    except Exception:
+                        pass
+
+            if not s.build_main:
+                continue
 
             new_name = f"{name}_{room_token}_shell.model"
             existing = bpy.data.objects.get(new_name)
@@ -2297,9 +2339,59 @@ class GN_OT_build_mlo(Operator):
             moved += 1
 
         _mlo_apply_collection_types(main_col)
-        msg = f"Built int_{name} with {moved} room shell(s)"
-        if replaced:
-            msg += f" ({replaced} rebuilt room(s) replaced)"
+        msg = f"Built int_{name}"
+        if s.build_main:
+            msg += f", {moved} room shell(s)"
+            if replaced:
+                msg += f" ({replaced} replaced)"
+
+        if s.build_shell_collision:
+            try:
+                from Sollumz.ybn.collision_materials import collisionmats as coll_mats
+            except ImportError:
+                coll_mats = None
+            shell_empty, room_meshes = _find_mlo_shell_data(name)
+            mat_mapping = {}
+            if shell_empty is not None:
+                seen = set()
+                for meshes in room_meshes.values():
+                    for o in meshes:
+                        for mat in o.data.materials:
+                            if mat and mat.name not in seen:
+                                seen.add(mat.name)
+                                idx = _guess_collision_material_index(mat.name)
+                                if idx > 0:
+                                    mat_mapping[mat.name] = idx
+            created, err = _do_build_shell_collision(context, name, mat_mapping)
+            if err:
+                msg += f", collision SKIPPED ({err})"
+            else:
+                msg += f", collision for {created} room(s)"
+
+        if s.build_portals:
+            try:
+                bpy.ops.gn_int.create_portals()
+                msg += ", portals"
+            except Exception as e:
+                msg += f", portals SKIPPED ({e})"
+
+        if s.build_empties:
+            to_create = [p for p in PRESET_EMPTIES if getattr(s, _PRESET_ATTR[p], False)]
+            for item in s.custom_empties:
+                if item.enabled and item.name.strip():
+                    to_create.append(item.name.strip())
+            n_empties = 0
+            target_tokens = built_room_tokens or [c.name for c in _gn_iter_room_collections(context)]
+            if to_create:
+                for room_token in target_tokens:
+                    rcol = bpy.data.collections.get(room_token)
+                    if rcol is None:
+                        continue
+                    for t in to_create:
+                        _gn_create_empty_in_room(rcol, name, room_token, t)
+                        n_empties += 1
+            msg += f", {n_empties} empt(y/ies)"
+
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
@@ -2461,7 +2553,7 @@ class GN_OT_create_shell_collision(Operator):
 
     def execute(self, context):
         try:
-            from Sollumz.sollumz_properties import SollumType
+            from Sollumz.sollumz_properties import SollumType   # noqa: F401
         except ImportError:
             self.report({'ERROR'}, "Sollumz addon not found")
             return {'CANCELLED'}
@@ -2470,10 +2562,6 @@ class GN_OT_create_shell_collision(Operator):
         name = s.mlo_name.strip()
         if not name:
             self.report({'ERROR'}, "Set an MLO Name first")
-            return {'CANCELLED'}
-        shell_empty, room_meshes = _find_mlo_shell_data(name)
-        if shell_empty is None or not room_meshes:
-            self.report({'ERROR'}, "Shell meshes not found")
             return {'CANCELLED'}
 
         try:
@@ -2489,6 +2577,33 @@ class GN_OT_create_shell_collision(Operator):
             if idx is not None:
                 mat_mapping[item.orig_mat_name] = idx
 
+        created, err = _do_build_shell_collision(context, name, mat_mapping)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Shell collision created for {created} room(s)")
+        return {'FINISHED'}
+
+
+def _do_build_shell_collision(context, name, mat_mapping):
+    """Core of Create Shell Collision, callable without the interactive
+    per-material dialog (e.g. from the Build MLO bulk popup, which passes an
+    auto-guessed mat_mapping instead). Returns (created_count, error_or_None)."""
+    try:
+        from Sollumz.sollumz_properties import SollumType
+    except ImportError:
+        return 0, "Sollumz addon not found"
+
+    shell_empty, room_meshes = _find_mlo_shell_data(name)
+    if shell_empty is None or not room_meshes:
+        return 0, "Shell meshes not found"
+
+    try:
+        from Sollumz.ybn.collision_materials import collisionmats as coll_mats
+    except ImportError:
+        coll_mats = None
+
+    if True:
         main_col = bpy.data.collections.get(f"int_{name}")
         coll_col = None
         if main_col:
@@ -2596,8 +2711,7 @@ class GN_OT_create_shell_collision(Operator):
 
             created += 1
 
-        self.report({'INFO'}, f"Shell collision created: '{root_obj.name}' with {created} room(s)")
-        return {'FINISHED'}
+    return created, None
 
 
 # ===========================================================================
@@ -4123,14 +4237,13 @@ class GN_PT_interior(_PanelBase, Panel):
 
 class GN_PT_setup(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
-    bl_label = "Setup"
+    bl_label = "Room Setup"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         s = context.scene.gn_int
         col = self.layout.column(align=True)
         col.prop(s, "room_height")
-        col.prop(s, "floor_gap")
         col.prop(s, "uv_scale")
 
 
@@ -4163,12 +4276,6 @@ class GN_PT_floors(_PanelBase, Panel):
         col.prop(s, "bridge")
         col.prop(s, "wall_margin")
         col.prop(s, "sample_offset")
-        row = box.row(align=True)
-        row.prop(s, "square", toggle=True)
-        sub = row.row(align=True)
-        sub.enabled = s.square
-        sub.prop(s, "ang_tol")
-        sub.prop(s, "allow45", toggle=True)
         box.label(text="Lock a floor to keep hand-edited boundaries", icon='INFO')
 
         layout.operator("gn_int.gen_boundaries", icon='MESH_GRID')
@@ -4284,7 +4391,16 @@ class GN_PT_mlo(_PanelBase, Panel):
         row = layout.row()
         row.alert = True
         row.operator("gn_int.clean_mlo", icon='TRASH')
-        layout.separator()
+
+
+class GN_PT_manual_setup(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_mlo"
+    bl_label = "Manual Setup"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Add anything that wasn't included in Build MLO", icon='INFO')
         layout.operator("gn_int.create_shell_collision", icon='MESH_ICOSPHERE')
         if GN_OT_create_shell_collision.poll(context) is False:
             layout.label(text="Needs the Sollumz add-on", icon='ERROR')
@@ -4292,7 +4408,7 @@ class GN_PT_mlo(_PanelBase, Panel):
 
 
 class GN_PT_add_empties(_PanelBase, Panel):
-    bl_parent_id = "GN_PT_mlo"
+    bl_parent_id = "GN_PT_manual_setup"
     bl_label = "Add Empties"
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -4323,7 +4439,7 @@ class GN_PT_add_empties(_PanelBase, Panel):
 
 
 class GN_PT_smart_rename(_PanelBase, Panel):
-    bl_parent_id = "GN_PT_mlo"
+    bl_parent_id = "GN_PT_manual_setup"
     bl_label = "Smart Rename"
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -4350,7 +4466,7 @@ class GN_PT_smart_rename(_PanelBase, Panel):
 
 
 class GN_PT_create_asset(_PanelBase, Panel):
-    bl_parent_id = "GN_PT_mlo"
+    bl_parent_id = "GN_PT_manual_setup"
     bl_label = "Create Asset"
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -4386,18 +4502,21 @@ _classes = (
     GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
-    GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo,
+    GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo, GN_PT_manual_setup,
     GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
 )
 
 
-_SETTINGS_KEYS = ("wall_margin", "room_height", "floor_gap", "sample_offset",
+_SETTINGS_KEYS = ("wall_margin", "room_height", "sample_offset",
                   "cleanup", "detail_tol", "bridge", "square", "ang_tol",
                   "allow45", "partition", "reveal", "uid_counter", "uv_scale",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
                   "threshold_depth", "threshold_flip", "threshold_offset",
-                  "mlo_name", "timecycle_name")
+                  "mlo_name", "timecycle_name",
+                  "build_main", "build_room_colls", "build_prop_colls",
+                  "build_asset_colls", "build_shell_collision", "build_portals",
+                  "build_empties")
 
 
 def _dump_scene(scene):
