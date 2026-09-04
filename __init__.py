@@ -2228,6 +2228,302 @@ class GN_OT_build_mlo(Operator):
         return {'FINISHED'}
 
 
+# ===========================================================================
+# Shell collision (Sollumz BOUND_COMPOSITE -> Shell.BVH -> R##_Shell.poly_mesh)
+# -- same hierarchy/behaviour as the user's scene_organizer.py
+# SO_OT_CreateShellCollision, adapted to read this tool's own Main-collection
+# shell naming (<name>_r0N_shell.model under <name>_shell). Run after
+# Build MLO Collections, since it reads the shells that step produces.
+# ===========================================================================
+def _guess_collision_material_index(hint):
+    """Keyword-match a material/room name to a Sollumz collision material
+    index. Falls back to 0 (DEFAULT) if Sollumz is unavailable or nothing
+    matches. Identical keyword list to scene_organizer.py for consistency."""
+    try:
+        from Sollumz.ybn.collision_materials import collisionmats
+    except ImportError:
+        return 0
+    name_to_idx = {m.name.upper(): i for i, m in enumerate(collisionmats)}
+    keyword_map = [
+        (["garage"], "METAL_GARAGE_DOOR"),
+        (["glass"], "GLASS_OPAQUE"),
+        (["wood", "timber", "plank", "oak", "pine",
+          "maple", "cedar", "mahogany", "walnut"], "WOOD_SOLID_LARGE"),
+        (["metal", "steel", "iron", "alum",
+          "copper", "brass", "zinc"], "METAL_SOLID_LARGE"),
+        (["rubber", "tyre", "tire"], "RUBBER"),
+        (["plastic", "pvc", "resin", "fibreglass", "fiberglass"], "PLASTIC"),
+        (["brick", "tile", "terrac"], "BRICK"),
+        (["stone", "marble", "granite", "rock", "slate"], "STONE"),
+        (["concrete", "cement"], "CONCRETE"),
+    ]
+    h = hint.lower()
+    for keywords, mat_name in keyword_map:
+        for kw in keywords:
+            if kw in h:
+                idx = name_to_idx.get(mat_name)
+                if idx is not None:
+                    return idx
+    return 0
+
+
+class GN_CollMatSearchItem(PropertyGroup):
+    """One entry in the searchable collision-material list (name only)."""
+    pass   # 'name' is the built-in PropertyGroup attribute used by prop_search
+
+
+class GN_ShellCollMappingItem(PropertyGroup):
+    orig_mat_name: StringProperty(name="Original Material", default="")
+    coll_mat_name: StringProperty(name="Collision Material", default="Keep Original")
+
+
+class GN_UL_shell_coll_mappings(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        row = layout.row(align=True)
+        row.label(text=item.orig_mat_name)
+        row.prop_search(item, "coll_mat_name", ctx.scene, "gn_coll_mat_search_items", text="")
+
+
+def _find_mlo_shell_data(mlo_name):
+    """Return (shell_empty, {room_token: [mesh_objs]}) matching
+    GN_OT_build_mlo's own <name>_r0N_shell(.model|_NN.model) naming, or
+    (None, {}) if the shell empty isn't found."""
+    shell_empty = bpy.data.objects.get(f"{mlo_name}_shell")
+    if shell_empty is None:
+        return None, {}
+    pat = re.compile(rf'^{re.escape(mlo_name)}_(r\d+)_shell(?:_\d+)?\.model$', re.IGNORECASE)
+    room_meshes = {}
+    for obj in shell_empty.children_recursive:
+        if obj.type != 'MESH':
+            continue
+        m = pat.match(obj.name)
+        if m:
+            room_meshes.setdefault(m.group(1).lower(), []).append(obj)
+    return shell_empty, room_meshes
+
+
+class GN_OT_create_shell_collision(Operator):
+    bl_idname = "gn_int.create_shell_collision"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Create Shell Collision"
+    bl_description = ("Build a Sollumz collision hierarchy (BOUND_COMPOSITE -> "
+                      "Shell.BVH -> R0N_Shell.poly_mesh) from the room shells "
+                      "in Main. Run after Build MLO Collections")
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            from Sollumz.sollumz_properties import SollumType   # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def invoke(self, context, event):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        shell_empty, room_meshes = _find_mlo_shell_data(name)
+        if shell_empty is None:
+            self.report({'ERROR'}, f"Shell empty '{name}_shell' not found - "
+                                    "run Build MLO Collections first")
+            return {'CANCELLED'}
+        if not room_meshes:
+            self.report({'ERROR'}, "No room shell meshes found under the shell empty")
+            return {'CANCELLED'}
+
+        unique_mats = []
+        for meshes in room_meshes.values():
+            for obj in meshes:
+                for mat in obj.data.materials:
+                    if mat and mat not in unique_mats:
+                        unique_mats.append(mat)
+
+        try:
+            from Sollumz.ybn.collision_materials import collisionmats as coll_mats
+        except ImportError:
+            coll_mats = None
+
+        search_items = context.scene.gn_coll_mat_search_items
+        search_items.clear()
+        keep = search_items.add()
+        keep.name = "Keep Original"
+        if coll_mats:
+            for m in coll_mats:
+                si = search_items.add()
+                si.name = m.name
+        else:
+            si = search_items.add()
+            si.name = "DEFAULT"
+
+        mappings = context.scene.gn_shell_coll_mappings
+        mappings.clear()
+        for mat in unique_mats:
+            item = mappings.add()
+            item.orig_mat_name = mat.name
+            guessed = _guess_collision_material_index(mat.name)
+            if guessed > 0 and coll_mats and guessed < len(coll_mats):
+                item.coll_mat_name = coll_mats[guessed].name
+            else:
+                item.coll_mat_name = "Keep Original"
+
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        layout = self.layout
+        mappings = context.scene.gn_shell_coll_mappings
+        layout.label(text="Assign collision materials to each shell material:", icon='INFO')
+        layout.label(text="'Keep Original' leaves the slot unchanged.", icon='BLANK1')
+        layout.separator()
+        if not mappings:
+            layout.label(text="No materials found on shell meshes.", icon='ERROR')
+            return
+        layout.template_list("GN_UL_shell_coll_mappings", "", context.scene,
+                             "gn_shell_coll_mappings", context.scene,
+                             "gn_shell_coll_active_idx", rows=6, maxrows=12)
+
+    def execute(self, context):
+        try:
+            from Sollumz.sollumz_properties import SollumType
+        except ImportError:
+            self.report({'ERROR'}, "Sollumz addon not found")
+            return {'CANCELLED'}
+
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        shell_empty, room_meshes = _find_mlo_shell_data(name)
+        if shell_empty is None or not room_meshes:
+            self.report({'ERROR'}, "Shell meshes not found")
+            return {'CANCELLED'}
+
+        try:
+            from Sollumz.ybn.collision_materials import collisionmats as coll_mats
+        except ImportError:
+            coll_mats = None
+        name_to_idx = {m.name: i for i, m in enumerate(coll_mats)} if coll_mats else {}
+        mat_mapping = {}
+        for item in context.scene.gn_shell_coll_mappings:
+            if item.coll_mat_name in ('', 'Keep Original'):
+                continue
+            idx = name_to_idx.get(item.coll_mat_name)
+            if idx is not None:
+                mat_mapping[item.orig_mat_name] = idx
+
+        main_col = bpy.data.collections.get(f"int_{name}")
+        coll_col = None
+        if main_col:
+            for child in main_col.children:
+                if child.name == "Collisions":
+                    coll_col = child
+                    break
+        if coll_col is None:
+            coll_col = _mlo_ensure_scene_collection("Collisions", context.scene)
+
+        IDENT = Matrix.Identity(4)
+
+        root_name = f"int_{name}"
+        root_obj = bpy.data.objects.get(root_name)
+        if root_obj is None or root_obj.type != 'EMPTY':
+            root_obj = bpy.data.objects.new(root_name + "_bound", None)
+        root_obj.empty_display_type = 'PLAIN_AXES'
+        root_obj.empty_display_size = 0.1
+        root_obj.sollum_type = SollumType.BOUND_COMPOSITE
+        root_obj.matrix_world = IDENT.copy()
+        if root_obj.name not in coll_col.objects:
+            coll_col.objects.link(root_obj)
+
+        bvh_name = "Shell.BVH"
+        bvh_obj = bpy.data.objects.get(bvh_name)
+        if bvh_obj is None:
+            bvh_obj = bpy.data.objects.new(bvh_name, None)
+        bvh_obj.empty_display_type = 'PLAIN_AXES'
+        bvh_obj.empty_display_size = 0.1
+        bvh_obj.sollum_type = SollumType.BOUND_GEOMETRYBVH
+        bvh_obj.parent = root_obj
+        bvh_obj.matrix_parent_inverse = IDENT.copy()
+        bvh_obj.location = (0, 0, 0)
+        if bvh_obj.name not in coll_col.objects:
+            coll_col.objects.link(bvh_obj)
+
+        try:
+            from Sollumz.ybn.collision_materials import create_collision_material_from_index
+            from Sollumz.sollumz_properties import MaterialType as _MatType
+        except ImportError:
+            create_collision_material_from_index = None
+            _MatType = None
+
+        created = 0
+        for room in sorted(room_meshes):
+            room_upper = room.upper()
+            poly_name = f"{room_upper}_Shell.poly_mesh"
+            src_objects = room_meshes[room]
+
+            merged_mats = []
+            mat_idx_maps = []
+            for src in src_objects:
+                idx_map = {}
+                for old_i, mat in enumerate(src.data.materials):
+                    if mat not in merged_mats:
+                        merged_mats.append(mat)
+                    idx_map[old_i] = merged_mats.index(mat)
+                mat_idx_maps.append(idx_map)
+
+            bm = bmesh.new()
+            for src, idx_map in zip(src_objects, mat_idx_maps):
+                tmp = src.data.copy()
+                tmp.transform(src.matrix_world)
+                for face in tmp.polygons:
+                    face.material_index = idx_map.get(face.material_index, 0)
+                bm.from_mesh(tmp)
+                bpy.data.meshes.remove(tmp)
+
+            poly_data = bpy.data.meshes.new(poly_name)
+            bm.to_mesh(poly_data)
+            bm.free()
+            poly_data.name = poly_name
+            for mat in merged_mats:
+                poly_data.materials.append(mat)
+
+            old_obj = bpy.data.objects.get(poly_name)
+            if old_obj:
+                bpy.data.objects.remove(old_obj, do_unlink=True)
+
+            poly_obj = bpy.data.objects.new(poly_name, poly_data)
+            poly_obj.sollum_type = SollumType.BOUND_POLY_TRIANGLE
+            poly_obj.parent = bvh_obj
+            poly_obj.matrix_parent_inverse = IDENT.copy()
+            poly_obj.matrix_world = IDENT.copy()
+            coll_col.objects.link(poly_obj)
+
+            for i in range(len(poly_obj.data.materials)):
+                slot_mat = poly_obj.data.materials[i]
+                if slot_mat is None:
+                    continue
+                col_idx = mat_mapping.get(slot_mat.name)
+                if col_idx is None:
+                    continue
+                col_mat_name = coll_mats[col_idx].name if coll_mats and col_idx < len(coll_mats) else "DEFAULT"
+                existing = bpy.data.materials.get(col_mat_name)
+                if (existing is not None and _MatType is not None
+                        and hasattr(existing, 'sollum_type')
+                        and existing.sollum_type == _MatType.COLLISION):
+                    col_mat = existing
+                elif create_collision_material_from_index is not None:
+                    col_mat = create_collision_material_from_index(col_idx)
+                else:
+                    col_mat = existing or bpy.data.materials.new(col_mat_name)
+                poly_obj.data.materials[i] = col_mat
+
+            created += 1
+
+        self.report({'INFO'}, f"Shell collision created: '{root_obj.name}' with {created} room(s)")
+        return {'FINISHED'}
+
+
 class GN_OT_clear_rooms(Operator):
     bl_idname = "gn_int.clear_rooms"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3200,21 +3496,26 @@ class GN_PT_mlo(_PanelBase, Panel):
         row = layout.row()
         row.alert = True
         row.operator("gn_int.clean_mlo", icon='TRASH')
+        layout.separator()
+        layout.operator("gn_int.create_shell_collision", icon='MESH_ICOSPHERE')
+        if GN_OT_create_shell_collision.poll(context) is False:
+            layout.label(text="Needs the Sollumz add-on", icon='ERROR')
 
 
 # ===========================================================================
 _classes = (
     GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset, GN_IntProps,
+    GN_CollMatSearchItem, GN_ShellCollMappingItem,
     GN_OT_set_exterior, GN_OT_add_floor_sel,
     GN_OT_add_floor_z, GN_OT_pick_floor_z,
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
     GN_OT_split_edges,
-    GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
+    GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo, GN_OT_create_shell_collision,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
-    GN_UL_door_presets, GN_UL_openings, GN_UL_floors,
+    GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo,
 )
@@ -3360,6 +3661,13 @@ def register():
     for c in _classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.gn_int = PointerProperty(type=GN_IntProps)
+    bpy.types.Scene.gn_shell_coll_active_idx = IntProperty(default=0)
+    bpy.types.Scene.gn_coll_mat_search_items = CollectionProperty(
+        type=GN_CollMatSearchItem,
+        description="Searchable list of Sollumz collision material names")
+    bpy.types.Scene.gn_shell_coll_mappings = CollectionProperty(
+        type=GN_ShellCollMappingItem,
+        description="Temporary material->collision mapping for Create Shell Collision")
     bpy.app.timers.register(_deferred_restore, first_interval=0.0)
     if _HL_HANDLE is None:
         _HL_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
@@ -3380,6 +3688,9 @@ def unregister():
     except Exception:
         pass
     del bpy.types.Scene.gn_int
+    del bpy.types.Scene.gn_shell_coll_active_idx
+    del bpy.types.Scene.gn_coll_mat_search_items
+    del bpy.types.Scene.gn_shell_coll_mappings
     for c in reversed(_classes):
         bpy.utils.unregister_class(c)
 
