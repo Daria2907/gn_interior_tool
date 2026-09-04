@@ -2524,6 +2524,201 @@ class GN_OT_create_shell_collision(Operator):
         return {'FINISHED'}
 
 
+# ===========================================================================
+# Portals -- one magenta quad per opening, named "<room> - <room>" (or
+# "<room> - Main" facing the exterior). Same visual/RageKit convention as
+# scene_organizer.py's Create/Rename Portal, but fully automatic: this tool
+# already knows each opening's position and can look up which room(s) it
+# borders, where scene_organizer needs the user to pick rooms by hand.
+# ===========================================================================
+def _mlo_apply_archetype_defaults(obj, set_static=False):
+    try:
+        arch = obj.ragequit_archetype
+        arch.lodDist = 200
+        arch.hdTextureDist = 100
+        arch.add_to_mlo = True
+        if set_static:
+            arch.flag_static = True
+    except Exception:
+        pass
+
+
+def _mlo_apply_sollumz_lod_defaults(obj):
+    try:
+        dp = obj.drawable_properties
+        dp.lod_dist_high = 9998.0
+        dp.lod_dist_med = 9998.0
+        dp.lod_dist_low = 9998.0
+        dp.lod_dist_vlow = 9998.0
+    except Exception:
+        pass
+
+
+def _mlo_get_portal_material():
+    """Shared 'Portal' material (solid magenta), matching scene_organizer.py."""
+    mat = bpy.data.materials.get("Portal")
+    if mat is None:
+        mat = bpy.data.materials.new("Portal")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (1.0, 0.0, 1.0, 1.0)
+        mat.diffuse_color = (1.0, 0.0, 1.0, 1.0)
+    mat.use_backface_culling = False
+    if hasattr(mat, 'use_backface_culling_shadow'):
+        mat.use_backface_culling_shadow = False
+    return mat
+
+
+def _mlo_room_token(room_obj_name):
+    """'r01' -> '1', 'r08' -> '8'. Anything else (e.g. 'Main') unchanged."""
+    if room_obj_name[:1] in ('r', 'R'):
+        try:
+            return str(int(room_obj_name[1:]))
+        except ValueError:
+            pass
+    return room_obj_name
+
+
+def _floor_idx_for_z(context, z):
+    """Which floor (index into s.floors) a world Z falls inside, else the
+    nearest one by base Z."""
+    tops = _floor_tops(context)
+    for i, (base, top, nxt) in enumerate(tops):
+        if base - 0.05 <= z <= top + 0.05:
+            return i
+    if tops:
+        return min(range(len(tops)), key=lambda i: abs(tops[i][0] - z))
+    return None
+
+
+def _rooms_for_opening(context, o):
+    """Which two rooms an opening borders: sample a point just inside the
+    wall on each side of its normal, on the floor matching its Z. A side
+    that isn't inside any room (facing outdoors) is labelled 'Main'."""
+    s = context.scene.gn_int
+    fi = _floor_idx_for_z(context, (o.sill + o.top) * 0.5)
+    if fi is None:
+        return "Main", "Main"
+    nrm = Vector((o.nx, o.ny))
+    if nrm.length < 1e-6:
+        return "Main", "Main"
+    nrm = nrm.normalized()
+    center = Vector((o.cx, o.cy))
+    probe = max(o.hw * 0.5, 0.3)
+    room_coll = bpy.data.collections.get(ROOM_COLL)
+
+    def token_at(pt):
+        ridx = _room_at_point(context, fi, pt)
+        if ridx < 0:
+            return "Main"
+        uid = s.rooms[ridx].uid
+        if room_coll:
+            for ob in room_coll.objects:
+                if ob.get("gn_room_uid") == uid:
+                    return _mlo_room_token(ob.name)
+        return "Main"
+
+    return token_at(center + nrm * probe), token_at(center - nrm * probe)
+
+
+def _spawn_portal(coll, world_positions, name):
+    """One Portal quad (magenta, +Y-facing winding) from 4 world corners,
+    origin at the quad's centre. Matches scene_organizer.py's _spawn_portal."""
+    mat = _mlo_get_portal_material()
+    center = sum(world_positions, Vector((0.0, 0.0, 0.0))) / len(world_positions)
+    local_positions = [p - center for p in world_positions]
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    bm_verts = [bm.verts.new(p) for p in local_positions]
+    face = bm.faces.new(bm_verts)
+    bm.normal_update()
+    if face.normal.y < 0.0:
+        face.normal_flip()
+        bm.normal_update()
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new(name, me)
+    ob.location = center
+    coll.objects.link(ob)
+    me.materials.append(mat)
+    _mlo_apply_archetype_defaults(ob)
+    _mlo_apply_sollumz_lod_defaults(ob)
+    return ob
+
+
+class GN_OT_create_portals(Operator):
+    bl_idname = "gn_int.create_portals"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Create Portals"
+    bl_description = ("Create a Portal quad at every opening, named "
+                      "'<room> - <room>' (or '<room> - Main' facing the "
+                      "exterior). Safe to re-run: a portal for an opening "
+                      "that's already been done is replaced, not duplicated")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        if not s.openings:
+            self.report({'ERROR'}, "No openings - run Project Openings first")
+            return {'CANCELLED'}
+
+        main_col = bpy.data.collections.get(f"int_{name}")
+        portals_col = None
+        if main_col:
+            for child in main_col.children:
+                if child.name == "Portals":
+                    portals_col = child
+                    break
+        if portals_col is None:
+            portals_col = _mlo_ensure_scene_collection("Portals", context.scene)
+
+        existing = {ob.get("gn_opening_uid"): ob for ob in portals_col.objects
+                   if ob.get("gn_opening_uid") is not None}
+
+        made = 0
+        skipped = 0
+        for o in s.openings:
+            nrm = Vector((o.nx, o.ny))
+            if nrm.length < 1e-6 or o.hw < 0.01 or o.top <= o.sill:
+                skipped += 1
+                continue
+            tangent = Vector((-nrm.y, nrm.x)).normalized()
+            c = Vector((o.cx, o.cy))
+            corners = [
+                Vector(((c - tangent * o.hw).x, (c - tangent * o.hw).y, o.sill)),
+                Vector(((c + tangent * o.hw).x, (c + tangent * o.hw).y, o.sill)),
+                Vector(((c + tangent * o.hw).x, (c + tangent * o.hw).y, o.top)),
+                Vector(((c - tangent * o.hw).x, (c - tangent * o.hw).y, o.top)),
+            ]
+            token_a, token_b = _rooms_for_opening(context, o)
+            portal_name = f"{token_a} - {token_b}"
+
+            old = existing.pop(o.uid, None)
+            if old:
+                bpy.data.objects.remove(old, do_unlink=True)
+
+            ob = _spawn_portal(portals_col, corners, portal_name)
+            ob["gn_opening_uid"] = o.uid
+            made += 1
+
+        removed = 0
+        for ob in existing.values():
+            bpy.data.objects.remove(ob, do_unlink=True)
+            removed += 1
+
+        msg = f"Created {made} portal(s)"
+        if skipped:
+            msg += f", {skipped} skipped (degenerate)"
+        if removed:
+            msg += f", {removed} stale removed"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class GN_OT_clear_rooms(Operator):
     bl_idname = "gn_int.clear_rooms"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3500,6 +3695,7 @@ class GN_PT_mlo(_PanelBase, Panel):
         layout.operator("gn_int.create_shell_collision", icon='MESH_ICOSPHERE')
         if GN_OT_create_shell_collision.poll(context) is False:
             layout.label(text="Needs the Sollumz add-on", icon='ERROR')
+        layout.operator("gn_int.create_portals", icon='OUTLINER_OB_LIGHTPROBE')
 
 
 # ===========================================================================
@@ -3513,6 +3709,7 @@ _classes = (
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
     GN_OT_split_edges,
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo, GN_OT_create_shell_collision,
+    GN_OT_create_portals,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
