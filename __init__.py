@@ -1876,6 +1876,56 @@ def _mlo_apply_collection_types(main_col):
             pass
 
 
+def _mlo_delete_collection_tree(col):
+    """Delete a collection and everything under it: every nested
+    sub-collection, and every object they contain (fully removed from the
+    .blend, not just unlinked). Returns (objects_removed, collections_removed)."""
+    obj_count = 0
+    col_count = 0
+    for child in list(col.children):
+        oc, cc = _mlo_delete_collection_tree(child)
+        obj_count += oc
+        col_count += cc
+    for ob in list(col.objects):
+        try:
+            bpy.data.objects.remove(ob, do_unlink=True)
+            obj_count += 1
+        except Exception:
+            pass
+    try:
+        bpy.data.collections.remove(col)
+        col_count += 1
+    except Exception:
+        pass
+    return obj_count, col_count
+
+
+class GN_OT_clean_mlo(Operator):
+    bl_idname = "gn_int.clean_mlo"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Clean MLO"
+    bl_description = ("Delete the int_<name> collection and everything in it -- "
+                      "shell meshes, room collections, and anything placed in "
+                      "Props/Assets since. Does NOT touch GN_Rooms, floors, or "
+                      "openings. Cannot be recovered except by Undo")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        col_name = f"int_{name}"
+        main_col = bpy.data.collections.get(col_name)
+        if main_col is None:
+            self.report({'INFO'}, f"'{col_name}' doesn't exist - nothing to clean")
+            return {'CANCELLED'}
+        obj_count, col_count = _mlo_delete_collection_tree(main_col)
+        self.report({'INFO'},
+                    f"Deleted {col_name}: {col_count} collection(s), {obj_count} object(s)")
+        return {'FINISHED'}
+
+
 class GN_OT_build_mlo(Operator):
     bl_idname = "gn_int.build_mlo"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2858,6 +2908,9 @@ class GN_PT_mlo(_PanelBase, Panel):
         layout.prop(s, "mlo_name")
         layout.prop(s, "timecycle_name")
         layout.operator("gn_int.build_mlo", icon='OUTLINER_COLLECTION')
+        row = layout.row()
+        row.alert = True
+        row.operator("gn_int.clean_mlo", icon='TRASH')
 
 
 # ===========================================================================
@@ -2868,7 +2921,7 @@ _classes = (
     GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_edges,
-    GN_OT_reunwrap, GN_OT_build_mlo,
+    GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors,
