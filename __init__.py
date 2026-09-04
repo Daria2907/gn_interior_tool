@@ -610,6 +610,12 @@ def _clear_named(coll, name):
 # ===========================================================================
 # properties
 # ===========================================================================
+class GN_CustomEmptyItem(PropertyGroup):
+    """One entry in the user's custom empty list (Add Empties)."""
+    name: StringProperty(name="Name", default="custom")
+    enabled: BoolProperty(name="Enabled", default=True)
+
+
 class GN_FloorLevel(PropertyGroup):
     z: FloatProperty(name="Base Z", default=0.0, unit='LENGTH')
     top: FloatProperty(name="Top Z", default=0.0, unit='LENGTH',
@@ -768,6 +774,40 @@ def _cb_redraw(self, context):
         pass
 
 
+_ROOM_NAME_RE = re.compile(r'^r\d+$', re.IGNORECASE)
+
+
+def _gn_iter_room_collections(context):
+    """Yield r<digits> collections under the active MLO (int_<mlo_name>),
+    falling back to any matching collections in the file if the MLO isn't
+    found (so pickers still work before Build MLO Collections has run)."""
+    try:
+        name = context.scene.gn_int.mlo_name.strip()
+    except Exception:
+        name = ""
+    mlo = bpy.data.collections.get(f"int_{name}") if name else None
+    if mlo is not None:
+        rooms = [c for c in mlo.children if _ROOM_NAME_RE.match(c.name)]
+        if rooms:
+            return sorted(rooms, key=lambda c: c.name)
+    return sorted((c for c in bpy.data.collections if _ROOM_NAME_RE.match(c.name)),
+                  key=lambda c: c.name)
+
+
+def _gn_room_enum_items(self, context):
+    items = [(c.name, c.name, f"Room collection {c.name}")
+            for c in _gn_iter_room_collections(context)]
+    if not items:
+        items.append(("NONE", "-- no rooms found --", "Build MLO Collections first"))
+    return items
+
+
+def _gn_room_number_from_name(room_name):
+    """'r01' -> '01' (keeps the zero-padding, unlike the portal-naming token)."""
+    m = re.search(r'(\d+)$', room_name)
+    return m.group(1) if m else room_name
+
+
 class GN_IntProps(PropertyGroup):
     exterior: PointerProperty(name="Exterior Shell", type=bpy.types.Object,
         description="The exterior building shell to read")
@@ -806,6 +846,42 @@ class GN_IntProps(PropertyGroup):
         "'<name>_shell'. Run this once, after rooms/doors are finished")
     timecycle_name: StringProperty(name="Timecycle", default="",
         description="RageKit room timecycle name (optional)")
+
+    # ── Add Empties ─────────────────────────────────────────────────────
+    empty_decals: BoolProperty(name="Decals", default=False)
+    empty_details: BoolProperty(name="Details", default=False)
+    empty_proxy: BoolProperty(name="Proxy", default=False)
+    empty_visuals: BoolProperty(name="Visuals", default=False)
+    empty_lights: BoolProperty(name="Lights", default=False)
+    empty_custom_name: StringProperty(name="Custom Name",
+        description="Name for a custom empty type", default="")
+    empty_target_room: EnumProperty(name="Target Room",
+        description="Room collection to add empties into", items=_gn_room_enum_items)
+    custom_empties: CollectionProperty(type=GN_CustomEmptyItem)
+
+    # ── Smart Rename ────────────────────────────────────────────────────
+    sr_room: EnumProperty(name="Room",
+        description="Room to use in the generated name", items=_gn_room_enum_items)
+    sr_category: EnumProperty(name="Category", description="Object category",
+        items=[('decals', "Decals", ""), ('details', "Details", ""),
+              ('proxy', "Proxy", ""), ('visuals', "Visuals", ""),
+              ('lights', "Lights", ""), ('custom', "Custom...", "")],
+        default='decals')
+    sr_category_custom: StringProperty(name="Custom Category",
+        description="Type a custom category name", default="")
+    sr_merge: BoolProperty(name="Merge after rename",
+        description="Apply modifiers, apply scale, rename UV to 'UVMap 0', "
+        "then join all selected objects", default=False)
+
+    # ── Create Asset ────────────────────────────────────────────────────
+    asset_type: EnumProperty(name="Asset Type",
+        items=[('DOOR', "Door", "Armature root, no .bvh"),
+              ('REGULAR', "Regular", "Empty root, with .bvh")],
+        default='REGULAR')
+    auto_collision: BoolProperty(name="Auto Collision",
+        description="Also build a .poly_mesh collision copy with guessed "
+        "collision materials per slot", default=True)
+
     floors: CollectionProperty(type=GN_FloorLevel)
     new_floor_z: FloatProperty(name="Z", default=0.0, unit='LENGTH',
         description="Base Z for the next floor added via 'Add Floor at Z'")
@@ -2570,6 +2646,28 @@ def _mlo_get_portal_material():
     return mat
 
 
+def _force_obj_name(obj, name, keep=None):
+    """Set obj.name to exactly `name`. If another object already holds that
+    name, move it ASIDE with a .NNN suffix rather than deleting it -- nothing
+    is ever removed, so existing scene objects can never disappear."""
+    existing = bpy.data.objects.get(name)
+    if existing and existing is not obj and existing is not keep:
+        existing.name = f"{name}.001"
+    obj.name = name
+
+
+def _force_data_name(data, name):
+    """Set a data-block's name to exactly `name`, moving any existing
+    occupant aside with a .NNN suffix instead of deleting it."""
+    for col in (bpy.data.meshes, bpy.data.armatures, bpy.data.curves,
+               bpy.data.metaballs, bpy.data.lattices):
+        conflict = col.get(name)
+        if conflict and conflict is not data:
+            conflict.name = f"{name}.001"
+            break
+    data.name = name
+
+
 def _mlo_room_token(room_obj_name):
     """'r01' -> '1', 'r08' -> '8'. Anything else (e.g. 'Main') unchanged."""
     if room_obj_name[:1] in ('r', 'R'):
@@ -2716,6 +2814,436 @@ class GN_OT_create_portals(Operator):
         if removed:
             msg += f", {removed} stale removed"
         self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+# ===========================================================================
+# Add Empties -- decals/details/proxy/visuals/lights (+ custom types) placed
+# in a room collection, named "<mlo>_<room_num>_<type>". Pivot = the room
+# object's own origin (already centred by _build_shell), matching
+# scene_organizer.py's Add Empties but without its separate pivot-override
+# system, which this tool doesn't need.
+# ===========================================================================
+PRESET_EMPTIES = ["decals", "details", "proxy", "visuals", "lights"]
+_PRESET_ATTR = {"decals": "empty_decals", "details": "empty_details",
+                "proxy": "empty_proxy", "visuals": "empty_visuals",
+                "lights": "empty_lights"}
+
+
+def _mlo_apply_empty_defaults(empty):
+    try:
+        from Sollumz.sollumz_properties import SollumType
+        empty.sollum_type = SollumType.DRAWABLE
+    except Exception:
+        pass
+    _mlo_apply_archetype_defaults(empty, set_static=True)
+    _mlo_apply_sollumz_lod_defaults(empty)
+
+
+def _gn_create_empty_in_room(room_col, mlo_name, room_name, empty_type_name):
+    room_num = _gn_room_number_from_name(room_name)
+    obj_name = f"{mlo_name}_{room_num}_{empty_type_name}"
+    pivot = (0.0, 0.0, 0.0)
+    room_ob = bpy.data.objects.get(room_name)
+    if room_ob is None:
+        rc = bpy.data.collections.get(ROOM_COLL)
+        if rc:
+            room_ob = rc.objects.get(room_name)
+    if room_ob is not None:
+        pivot = tuple(room_ob.matrix_world.translation)
+
+    existing = bpy.data.objects.get(obj_name)
+    if existing is not None:
+        if room_col.name not in [c.name for c in existing.users_collection]:
+            room_col.objects.link(existing)
+        return existing
+
+    empty = bpy.data.objects.new(obj_name, None)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.location = pivot
+    room_col.objects.link(empty)
+    _mlo_apply_empty_defaults(empty)
+    return empty
+
+
+class GN_OT_add_empties(Operator):
+    bl_idname = "gn_int.add_empties"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Selected Empties"
+    bl_description = ("Add enabled empties to the selected room collection "
+                      "(r01, r02...). Pivot = that room object's own origin")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        room_col = bpy.data.collections.get(s.empty_target_room) if s.empty_target_room else None
+        if room_col is None or s.empty_target_room in ("NONE", ""):
+            rooms = _gn_iter_room_collections(context)
+            if not rooms:
+                self.report({'ERROR'}, "No room collections found - run Build MLO Collections first")
+                return {'CANCELLED'}
+            room_col = rooms[0]
+            try:
+                s.empty_target_room = room_col.name
+            except Exception:
+                pass
+
+        to_create = [p for p in PRESET_EMPTIES if getattr(s, _PRESET_ATTR[p], False)]
+        for item in s.custom_empties:
+            if item.enabled and item.name.strip():
+                to_create.append(item.name.strip())
+        if not to_create:
+            self.report({'WARNING'}, "Tick at least one preset or custom empty above")
+            return {'CANCELLED'}
+
+        created = [_gn_create_empty_in_room(room_col, name, room_col.name, t).name
+                  for t in to_create]
+        self.report({'INFO'},
+                    f"Added {len(created)} empty(s) to '{room_col.name}': {', '.join(created)}")
+        return {'FINISHED'}
+
+
+class GN_OT_add_custom_empty(Operator):
+    bl_idname = "gn_int.add_custom_empty"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Custom Empty Type"
+    bl_description = "Add a custom empty type to the list"
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        nm = s.empty_custom_name.strip()
+        if not nm:
+            self.report({'WARNING'}, "Enter a name in Custom Name first")
+            return {'CANCELLED'}
+        if nm in [e.name for e in s.custom_empties]:
+            self.report({'WARNING'}, f"'{nm}' is already in the list")
+            return {'CANCELLED'}
+        item = s.custom_empties.add()
+        item.name = nm
+        s.empty_custom_name = ""
+        return {'FINISHED'}
+
+
+class GN_OT_remove_custom_empty(Operator):
+    bl_idname = "gn_int.remove_custom_empty"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Remove"
+    bl_description = "Remove this custom empty type"
+    index: IntProperty()
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        if 0 <= self.index < len(s.custom_empties):
+            s.custom_empties.remove(self.index)
+        return {'FINISHED'}
+
+
+# ===========================================================================
+# Smart Rename -- rename selected mesh objects to "<mlo>_<room>_<category>"
+# (Blender auto-dedups .001, .002...), optionally applying modifiers/scale,
+# renaming the UV map to "UVMap 0", and joining into one object.
+# ===========================================================================
+class GN_OT_smart_rename(Operator):
+    bl_idname = "gn_int.smart_rename"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Rename Selected"
+    bl_description = ("Rename selected mesh objects to <mlo>_<room>_<category>. "
+                      "Optionally applies modifiers/scale, renames UV to "
+                      "'UVMap 0', then merges into one object")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=280)
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        col = self.layout.column(align=True)
+        col.label(text=f"MLO: {s.mlo_name or '-- not set --'}", icon='SCENE_DATA')
+        col.prop(s, "sr_room", text="Room")
+        col.prop(s, "sr_category", text="Category")
+        if s.sr_category == 'custom':
+            col.prop(s, "sr_category_custom", text="Custom")
+        self.layout.prop(s, "sr_merge")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        if not name:
+            self.report({'ERROR'}, "Set an MLO Name first")
+            return {'CANCELLED'}
+        room = s.sr_room
+        if room in ('NONE', ''):
+            self.report({'WARNING'}, "No room selected - build rooms first")
+            return {'CANCELLED'}
+        category = s.sr_category
+        if category == 'custom':
+            category = s.sr_category_custom.strip()
+            if not category:
+                self.report({'WARNING'}, "Enter a custom category")
+                return {'CANCELLED'}
+
+        objects = sorted([o for o in context.selected_objects if o.type == 'MESH'],
+                         key=lambda o: o.name)
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        base = f"{name}_{room}_{category}"
+        for i, obj in enumerate(objects):
+            obj.name = f"__gn_tmp_{i:04d}__"
+        for obj in objects:
+            obj.name = base
+
+        if s.sr_merge:
+            for obj in objects:
+                for mod in list(obj.modifiers):
+                    try:
+                        with context.temp_override(object=obj,
+                                                    selected_editable_objects=[obj],
+                                                    active_object=obj):
+                            bpy.ops.object.modifier_apply(modifier=mod.name)
+                    except Exception:
+                        pass
+                try:
+                    with context.temp_override(selected_editable_objects=[obj],
+                                                active_object=obj, object=obj):
+                        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                except Exception:
+                    pass
+                if obj.data and obj.data.uv_layers:
+                    obj.data.uv_layers[0].name = "UVMap 0"
+
+            all_matching = [o for o in bpy.data.objects
+                           if o.name == base or re.match(rf'^{re.escape(base)}\.\d+$', o.name)]
+            if len(all_matching) > 1:
+                target = bpy.data.objects.get(base) or all_matching[0]
+                scene_col = context.scene.collection
+                for o in all_matching:
+                    try:
+                        scene_col.objects.link(o)
+                    except RuntimeError:
+                        pass
+                try:
+                    with context.temp_override(
+                            window=context.window, scene=context.scene,
+                            view_layer=context.view_layer,
+                            selected_objects=all_matching,
+                            selected_editable_objects=all_matching,
+                            active_object=target, object=target):
+                        bpy.ops.object.join()
+                    target.name = base
+                    self.report({'INFO'},
+                                f"Renamed and merged {len(all_matching)} object(s) -> '{base}'")
+                    return {'FINISHED'}
+                except RuntimeError as e:
+                    self.report({'WARNING'}, f"Join failed: {e}")
+
+        self.report({'INFO'}, f"Renamed {len(objects)} object(s) -> '{base}'")
+        return {'FINISHED'}
+
+
+# ===========================================================================
+# Create Asset -- Sollumz asset hierarchy for the selected mesh, placed at
+# world origin in Assets (or Assets/Doors for door assets). Same structure
+# as scene_organizer.py's Create Asset: Door -> Armature, Regular -> Empty,
+# each DRAWABLE -> .col (BOUND_COMPOSITE) -> [.bvh ->] .poly_mesh (only when
+# Auto Collision is on) + .model (the original mesh, moved into the
+# hierarchy, keeping its own name). Matching instances already placed in
+# Props_*/Assets_*/Doors* collections are relinked to the shared mesh.
+# ===========================================================================
+class GN_OT_create_asset(Operator):
+    bl_idname = "gn_int.create_asset"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Create Asset"
+    bl_description = ("Build a Sollumz asset hierarchy for the selected mesh. "
+                      "Select mesh, set options, click Create. The asset "
+                      "keeps the selected object's name")
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            from Sollumz.sollumz_properties import SollumType   # noqa: F401
+        except ImportError:
+            return False
+        return (context.mode == 'OBJECT' and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        try:
+            from Sollumz.sollumz_properties import SollumType
+        except ImportError:
+            self.report({'ERROR'}, "Sollumz addon not found")
+            return {'CANCELLED'}
+
+        s = context.scene.gn_int
+        name = s.mlo_name.strip()
+        obj = context.active_object
+        asset_type = s.asset_type
+        auto_collision = s.auto_collision
+
+        base = obj.name.split('.', 1)[0].strip()
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        shared_data = obj.data
+        _force_data_name(shared_data, base)
+
+        name_bvh = f"{base}.bvh"
+        name_poly = f"{base}.poly_mesh"
+        name_model = f"{base}.model"
+
+        main_col = bpy.data.collections.get(f"int_{name}") if name else None
+        assets_col = None
+        if main_col:
+            for c in main_col.children:
+                if c.name == "Assets":
+                    assets_col = c
+                    break
+        if assets_col is None:
+            assets_col = _mlo_ensure_scene_collection("Assets", context.scene)
+        if asset_type == 'DOOR':
+            dest_col = None
+            for c in assets_col.children:
+                if c.name == "Doors":
+                    dest_col = c
+                    break
+            if dest_col is None:
+                dest_col = _mlo_make_collection("Doors", assets_col)
+        else:
+            dest_col = assets_col
+
+        IDENT = Matrix.Identity(4)
+
+        if asset_type == 'DOOR':
+            arm_data = bpy.data.armatures.new(base)
+            root_obj = bpy.data.objects.new(base, arm_data)
+        else:
+            root_obj = bpy.data.objects.new(base, None)
+            root_obj.empty_display_type = 'PLAIN_AXES'
+            root_obj.empty_display_size = 0.1
+        _force_obj_name(root_obj, base)
+        root_obj.sollum_type = SollumType.DRAWABLE
+        root_obj.matrix_world = IDENT.copy()
+        dest_col.objects.link(root_obj)
+        _mlo_apply_archetype_defaults(root_obj, set_static=True)
+        _mlo_apply_sollumz_lod_defaults(root_obj)
+
+        col_name = f"{base}.col"
+        col_obj = bpy.data.objects.new(col_name, None)
+        _force_obj_name(col_obj, col_name)
+        col_obj.empty_display_type = 'PLAIN_AXES'
+        col_obj.empty_display_size = 0.1
+        col_obj.sollum_type = SollumType.BOUND_COMPOSITE
+        col_obj.parent = root_obj
+        col_obj.matrix_parent_inverse = IDENT.copy()
+        col_obj.location = (0, 0, 0)
+        dest_col.objects.link(col_obj)
+
+        door_rot_fix = None
+        if asset_type == 'DOOR':
+            vcos = obj.data.vertices
+            if vcos:
+                spread_x = max(v.co.x for v in vcos) - min(v.co.x for v in vcos)
+                spread_y = max(v.co.y for v in vcos) - min(v.co.y for v in vcos)
+                if spread_y > spread_x:
+                    rot_fix = Matrix.Rotation(math.pi / 2, 3, 'Z')
+                    for v in vcos:
+                        v.co = rot_fix @ v.co
+                    obj.data.update()
+                    door_rot_fix = Matrix.Rotation(math.pi / 2, 4, 'Z')
+
+        if auto_collision:
+            if asset_type == 'DOOR':
+                poly_parent = col_obj
+            else:
+                bvh_obj = bpy.data.objects.new(name_bvh, None)
+                _force_obj_name(bvh_obj, name_bvh)
+                bvh_obj.empty_display_type = 'PLAIN_AXES'
+                bvh_obj.empty_display_size = 0.1
+                bvh_obj.sollum_type = SollumType.BOUND_GEOMETRYBVH
+                bvh_obj.parent = col_obj
+                bvh_obj.matrix_parent_inverse = IDENT.copy()
+                bvh_obj.location = (0, 0, 0)
+                dest_col.objects.link(bvh_obj)
+                poly_parent = bvh_obj
+
+            poly_data = obj.data.copy()
+            _force_data_name(poly_data, name_poly)
+            poly_obj = bpy.data.objects.new(name_poly, poly_data)
+            _force_obj_name(poly_obj, name_poly)
+            poly_obj.sollum_type = SollumType.BOUND_POLY_TRIANGLE
+            poly_obj.parent = poly_parent
+            poly_obj.matrix_parent_inverse = IDENT.copy()
+            poly_obj.location = (0, 0, 0)
+            dest_col.objects.link(poly_obj)
+
+            try:
+                from Sollumz.ybn.collision_materials import (
+                    collisionmats as coll_mats,
+                    create_collision_material_from_index as mk_col_mat)
+                from Sollumz.sollumz_properties import MaterialType as MatType
+            except ImportError:
+                coll_mats = None
+                mk_col_mat = None
+                MatType = None
+
+            orig_slot_names = [m.name if m else "" for m in poly_obj.data.materials] or [""]
+            poly_obj.data.materials.clear()
+            for slot_name in orig_slot_names:
+                hint = f"{base} {slot_name}".strip()
+                col_idx = _guess_collision_material_index(hint)
+                col_mat_name = (coll_mats[col_idx].name
+                               if coll_mats and col_idx < len(coll_mats) else "DEFAULT")
+                existing = bpy.data.materials.get(col_mat_name)
+                if (existing is not None and MatType is not None
+                        and hasattr(existing, 'sollum_type')
+                        and existing.sollum_type == MatType.COLLISION):
+                    col_mat = existing
+                elif mk_col_mat is not None:
+                    col_mat = mk_col_mat(col_idx)
+                else:
+                    col_mat = existing or bpy.data.materials.new(col_mat_name)
+                poly_obj.data.materials.append(col_mat)
+
+        for c in list(obj.users_collection):
+            c.objects.unlink(obj)
+        dest_col.objects.link(obj)
+        _force_obj_name(obj, name_model)
+        obj.sollum_type = SollumType.DRAWABLE_MODEL
+        obj.parent = root_obj
+        obj.matrix_parent_inverse = IDENT.copy()
+        obj.matrix_world = IDENT.copy()
+        _mlo_apply_archetype_defaults(obj, set_static=True)
+        _mlo_apply_sollumz_lod_defaults(obj)
+
+        def _strip_dedup(n):
+            return re.sub(r'\.\d+$', '', n)
+
+        def _is_instance_col(c):
+            n = c.name.lower()
+            return (n.startswith("props_") or n.startswith("prop_")
+                    or n.startswith("assets_") or n.startswith("doors"))
+
+        props_renamed = 0
+        for pobj in bpy.data.objects:
+            if pobj.type != 'MESH' or pobj is obj:
+                continue
+            if not any(_is_instance_col(c) for c in pobj.users_collection):
+                continue
+            name_match = _strip_dedup(pobj.name) == base
+            data_match = pobj.data is shared_data
+            if name_match or data_match:
+                pobj.name = base
+                pobj.data = shared_data
+                if door_rot_fix is not None:
+                    pobj.matrix_world = pobj.matrix_world @ door_rot_fix.inverted()
+                props_renamed += 1
+
+        kind = "door" if asset_type == 'DOOR' else "regular"
+        coll = "auto" if auto_collision else "manual"
+        extra = f" Renamed {props_renamed} prop instance(s)." if props_renamed else ""
+        self.report({'INFO'}, f"Created {kind} asset '{base}' with {coll} collision.{extra}")
         return {'FINISHED'}
 
 
@@ -3763,9 +4291,85 @@ class GN_PT_mlo(_PanelBase, Panel):
         layout.operator("gn_int.create_portals", icon='OUTLINER_OB_LIGHTPROBE')
 
 
+class GN_PT_add_empties(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_mlo"
+    bl_label = "Add Empties"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        layout.prop(s, "empty_target_room", icon='OUTLINER_COLLECTION')
+        layout.separator()
+        box = layout.box()
+        box.label(text="Presets:", icon='EMPTY_AXIS')
+        grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        for preset in PRESET_EMPTIES:
+            grid.prop(s, _PRESET_ATTR[preset], toggle=True)
+        layout.separator()
+        box = layout.box()
+        box.label(text="Custom:", icon='ADD')
+        for i, item in enumerate(s.custom_empties):
+            row = box.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.prop(item, "name", text="")
+            op = row.operator("gn_int.remove_custom_empty", text="", icon='X')
+            op.index = i
+        row = box.row(align=True)
+        row.prop(s, "empty_custom_name", text="")
+        row.operator("gn_int.add_custom_empty", text="", icon='ADD')
+        layout.separator()
+        layout.operator("gn_int.add_empties", icon='EMPTY_AXIS')
+
+
+class GN_PT_smart_rename(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_mlo"
+    bl_label = "Smart Rename"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        box = layout.box()
+        row = box.row()
+        row.label(text="MLO:", icon='SCENE_DATA')
+        row.label(text=s.mlo_name if s.mlo_name else "-- not set --")
+        box.prop(s, "sr_room", icon='OUTLINER_COLLECTION')
+        box.prop(s, "sr_category", icon='FILTER')
+        if s.sr_category == 'custom':
+            box.prop(s, "sr_category_custom", text="", icon='GREASEPENCIL')
+        box.separator()
+        cat = s.sr_category_custom.strip() if s.sr_category == 'custom' else s.sr_category
+        room = s.sr_room if s.sr_room != 'NONE' else '???'
+        mlo = s.mlo_name if s.mlo_name else '???'
+        box.label(text=f"-> {mlo}_{room}_{cat}", icon='INFO')
+        layout.separator()
+        layout.prop(s, "sr_merge", icon='AUTOMERGE_ON')
+        layout.separator()
+        layout.operator("gn_int.smart_rename", icon='SORTALPHA')
+
+
+class GN_PT_create_asset(_PanelBase, Panel):
+    bl_parent_id = "GN_PT_mlo"
+    bl_label = "Create Asset"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        s = context.scene.gn_int
+        layout = self.layout
+        layout.label(text="Select mesh, set options, click Create.", icon='INFO')
+        layout.label(text="Asset keeps the selected object's name.", icon='INFO')
+        layout.prop(s, "asset_type", expand=True)
+        layout.prop(s, "auto_collision")
+        layout.operator("gn_int.create_asset", icon='ADD')
+        if GN_OT_create_asset.poll(context) is False:
+            layout.label(text="Needs the Sollumz add-on + a selected mesh", icon='ERROR')
+
+
 # ===========================================================================
 _classes = (
-    GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset, GN_IntProps,
+    GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset,
+    GN_CustomEmptyItem, GN_IntProps,
     GN_CollMatSearchItem, GN_ShellCollMappingItem,
     GN_OT_set_exterior, GN_OT_add_floor_sel,
     GN_OT_add_floor_z, GN_OT_pick_floor_z,
@@ -3775,12 +4379,15 @@ _classes = (
     GN_OT_split_edges,
     GN_OT_reunwrap, GN_OT_build_mlo, GN_OT_clean_mlo, GN_OT_create_shell_collision,
     GN_OT_create_portals,
+    GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
+    GN_OT_smart_rename, GN_OT_create_asset,
     GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
     GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
     GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo,
+    GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
 )
 
 
