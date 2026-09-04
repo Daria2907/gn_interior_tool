@@ -4229,10 +4229,10 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         faces.append((base, base + 1, base + 2, base + 3))
         cats.append(cat)
 
-    def ngon(pts, cat):
+    def tri(a, b, c, cat):
         base = len(verts)
-        verts.extend(pts)
-        faces.append(tuple(range(base, base + len(pts))))
+        verts.extend([a, b, c])
+        faces.append((base, base + 1, base + 2))
         cats.append(cat)
 
     def step_nosing_r(rise_):
@@ -4291,18 +4291,31 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
             zh = z_bot + (i + 1) * rise
             xf, yf = side_xy(b, t, tf)
             xb, yb = side_xy(b, t, tb)
-            pts = [(xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh)]
             R = step_nosing_r(rise)
             if R > 1e-4:
                 f = fwd(xf, yf, xb, yb)
+                arc_pts = []
                 for k in range(_STAIR_NOSING_ARC_SEGS + 1):  # tip (0) to recessed (90)
                     th = thetas[k]
                     off = -R + R * math.sin(th)
                     zz = (zh - R) + R * math.cos(th)
-                    pts.append((xf + f.x * off, yf + f.y * off, zz))
+                    arc_pts.append((xf + f.x * off, yf + f.y * off, zz))
+                recessed = arc_pts[-1]
+                # the arc bulges OUTWARD past xf, making the full per-step
+                # outline concave there -- a single face over that (an ngon)
+                # is left for the renderer to auto-triangulate, and for a
+                # concave shape that can produce exactly the wrong (spiky)
+                # result regardless of how correct the boundary edges are.
+                # Split explicitly instead: a plain, safely-convex quad for
+                # the step's main body (down to the recessed corner, not
+                # z_bot to zh), plus a small fan -- anchored at the NEAR
+                # (xb, zh) corner, not a far one -- closing just the small
+                # nosing bulge on its own.
+                quad((xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh), recessed, MAT_STAIR_SIDE)
+                for k in range(_STAIR_NOSING_ARC_SEGS):
+                    tri((xb, yb, zh), arc_pts[k], arc_pts[k + 1], MAT_STAIR_SIDE)
             else:
-                pts.append((xf, yf, zh))
-            ngon(pts, MAT_STAIR_SIDE)
+                quad((xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh), (xf, yf, zh), MAT_STAIR_SIDE)
 
     return verts, faces, cats
 
