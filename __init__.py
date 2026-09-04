@@ -47,6 +47,7 @@ CUTTER_COLL = "GN_Cutters"
 DOORFRAME_COLL = "GN_DoorFrames"
 WINDOWFRAME_COLL = "GN_WindowFrames"
 THRESHOLD_COLL = "GN_Thresholds"
+OPENING_PIECES_COLL = "Openings"
 
 
 # ===========================================================================
@@ -3949,6 +3950,87 @@ def _piece_frame(obj):
     return center, u, v, n, (max(us) - min(us)) * 0.5, (max(vs) - min(vs)) * 0.5
 
 
+def _collect_into(objs, coll):
+    for o in objs:
+        for c in list(o.users_collection):
+            if c is not coll:
+                c.objects.unlink(o)
+        if coll not in o.users_collection:
+            coll.objects.link(o)
+
+
+class GN_OT_split_opening_pieces(Operator):
+    bl_idname = "gn_int.split_opening_pieces"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Duplicate & Split Selected"
+    bl_description = ("Duplicate the selected window/door geometry, split it into one "
+                      "object per disconnected piece, and collect them in the "
+                      "'Openings' collection -- ready to select-all and Project. "
+                      "Works on a face selection in Edit Mode, or on whole objects "
+                      "in Object Mode; the source mesh is left untouched")
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode == 'EDIT_MESH':
+            return context.active_object is not None
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        coll = _get_coll(OPENING_PIECES_COLL)
+
+        if context.mode == 'EDIT_MESH':
+            ob = context.active_object
+            bm = bmesh.from_edit_mesh(ob.data)
+            if not any(f.select for f in bm.faces):
+                self.report({'ERROR'}, "Select the window/door faces to split first")
+                return {'CANCELLED'}
+            before = set(bpy.data.objects.keys())
+            bpy.ops.mesh.duplicate()
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            new_objs = [o for k, o in bpy.data.objects.items() if k not in before]
+        else:
+            srcs = [o for o in context.selected_objects if o.type == 'MESH']
+            if not srcs:
+                self.report({'ERROR'}, "Select the window/door mesh(es) to split first")
+                return {'CANCELLED'}
+            dups = []
+            for src in srcs:
+                dup = src.copy()
+                dup.data = src.data.copy()
+                for c in src.users_collection:
+                    c.objects.link(dup)
+                dups.append(dup)
+            bpy.ops.object.select_all(action='DESELECT')
+            for o in dups:
+                o.select_set(True)
+            context.view_layer.objects.active = dups[-1]
+            new_objs = dups
+
+        # split whatever we now have into one object per disconnected piece
+        before = set(bpy.data.objects.keys())
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in new_objs:
+            o.select_set(True)
+        context.view_layer.objects.active = new_objs[-1]
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.separate(type='LOOSE')
+        bpy.ops.object.mode_set(mode='OBJECT')
+        result = [o for o in context.selected_objects]
+        result += [o for k, o in bpy.data.objects.items()
+                  if k not in before and o not in result]
+
+        _collect_into(result, coll)
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in result:
+            o.select_set(True)
+        if result:
+            context.view_layer.objects.active = result[-1]
+        self.report({'INFO'}, f"Split into {len(result)} opening piece(s) in '{OPENING_PIECES_COLL}'")
+        return {'FINISHED'}
+
+
 class GN_OT_project_openings(Operator):
     bl_idname = "gn_int.project_openings"
     bl_options = {'REGISTER', 'UNDO'}
@@ -4580,6 +4662,9 @@ class GN_PT_openings(_PanelBase, Panel):
     def draw(self, context):
         s = context.scene.gn_int
         layout = self.layout
+        layout.operator("gn_int.split_opening_pieces", icon='MOD_EXPLODE')
+        layout.label(text="Select window/door faces or objects, then split", icon='INFO')
+        layout.separator()
         layout.prop(s, "reveal")
         layout.operator("gn_int.project_openings", icon='SELECT_DIFFERENCE')
         layout.label(text="Select window/door pieces, then project", icon='INFO')
@@ -4782,7 +4867,7 @@ _classes = (
     GN_OT_create_portals, GN_OT_remove_portal, GN_OT_flip_portal,
     GN_OT_add_empties, GN_OT_add_custom_empty, GN_OT_remove_custom_empty,
     GN_OT_smart_rename, GN_OT_create_asset,
-    GN_OT_project_openings, GN_OT_clear_openings,
+    GN_OT_split_opening_pieces, GN_OT_project_openings, GN_OT_clear_openings,
     GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
     GN_OT_clean_stale_openings,
     GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
