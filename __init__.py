@@ -3210,13 +3210,20 @@ class GN_OT_flip_portal(Operator):
         bm.to_mesh(ob.data)
         bm.free()
         ob.data.update()
+        # keep the name's "from - to" order matching the now-flipped normal
+        parts = ob.name.split(" - ", 1)
+        if len(parts) == 2:
+            ob.name = f"{parts[1]} - {parts[0]}"
         self.report({'INFO'}, f"Flipped '{ob.name}'")
         return {'FINISHED'}
 
 
-def _spawn_portal(coll, world_positions, name):
-    """One Portal quad (magenta, +Y-facing winding) from 4 world corners,
-    origin at the quad's centre. Matches scene_organizer.py's _spawn_portal."""
+def _spawn_portal(coll, world_positions, name, face_dir=None):
+    """One Portal quad from 4 world corners, origin at the quad's centre.
+    face_dir (world-space Vector, optional): the face normal is flipped to
+    point this way -- so 'A - B' consistently means the normal points
+    toward B. Falls back to the old always-+Y winding when face_dir is
+    None (matches scene_organizer.py's _spawn_portal)."""
     mat = _mlo_get_portal_material()
     center = sum(world_positions, Vector((0.0, 0.0, 0.0))) / len(world_positions)
     local_positions = [p - center for p in world_positions]
@@ -3225,7 +3232,8 @@ def _spawn_portal(coll, world_positions, name):
     bm_verts = [bm.verts.new(p) for p in local_positions]
     face = bm.faces.new(bm_verts)
     bm.normal_update()
-    if face.normal.y < 0.0:
+    flip = (face.normal.dot(face_dir) < 0.0) if face_dir is not None else (face.normal.y < 0.0)
+    if flip:
         face.normal_flip()
         bm.normal_update()
     bm.to_mesh(me)
@@ -3274,20 +3282,42 @@ class GN_OT_create_portals(Operator):
                 continue
             tangent = Vector((-nrm.y, nrm.x)).normalized()
             c = Vector((o.cx, o.cy))
+            # token_to = the room the opening's normal (o.nx, o.ny) points
+            # toward; token_from = the room behind it. Name is "from - to"
+            # so it reads in the direction the portal actually faces.
+            token_to, token_from = _rooms_for_opening(context, o)
+            portal_name = f"{token_from} - {token_to}"
+
+            # A room's wall reveal (Boundary cleanup > win/door reveal) is
+            # extruded OUTWARD from this same hole rectangle, away from that
+            # room, by _build_wall -- so at a room/limbo boundary the portal
+            # (sitting at the raw hole) reads as recessed behind that jamb.
+            # Push it out to the jamb's outer rim, toward whichever side is
+            # limbo. A room-to-room opening needs no shift: both sides'
+            # jambs already meet exactly at the raw centre.
+            rd = 0.0
+            if s.reveal:
+                rd = (s.partition * 0.5) if o.is_door else s.wall_margin
+            shift = Vector((0.0, 0.0))
+            if rd > 1e-4:
+                if token_to == "limbo" and token_from != "limbo":
+                    shift = nrm * rd
+                elif token_from == "limbo" and token_to != "limbo":
+                    shift = -nrm * rd
+            c = c + shift
             corners = [
                 Vector(((c - tangent * o.hw).x, (c - tangent * o.hw).y, o.sill)),
                 Vector(((c + tangent * o.hw).x, (c + tangent * o.hw).y, o.sill)),
                 Vector(((c + tangent * o.hw).x, (c + tangent * o.hw).y, o.top)),
                 Vector(((c - tangent * o.hw).x, (c - tangent * o.hw).y, o.top)),
             ]
-            token_a, token_b = _rooms_for_opening(context, o)
-            portal_name = f"{token_a} - {token_b}"
 
             old = existing.pop(o.uid, None)
             if old:
                 bpy.data.objects.remove(old, do_unlink=True)
 
-            ob = _spawn_portal(portals_col, corners, portal_name)
+            ob = _spawn_portal(portals_col, corners, portal_name,
+                               face_dir=Vector((o.nx, o.ny, 0.0)))
             ob["gn_opening_uid"] = o.uid
             made += 1
 
