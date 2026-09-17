@@ -1,0 +1,144 @@
+===========================================================================
+ ULTIMATE MLO TOOL  -  How to use
+ Exterior-aware interior generator for GTA V MLO work in Blender
+===========================================================================
+
+Works on Windows, macOS and Linux. Tested on Blender 5.0 (needs 4.2 or newer).
+A window library is bundled inside the add-on, so windows work out of the box
+with nothing to configure.
+
+
+---------------------------------------------------------------------------
+ 1. INSTALL  (Windows)
+---------------------------------------------------------------------------
+
+You have a ZIP named  gn_interior_tool.zip
+
+  1. Open Blender.
+  2. Edit menu  ->  Preferences  ->  Add-ons.
+  3. Top-right drop-down (v)  ->  "Install from Disk..."
+     (older Blender: the "Install..." button).
+  4. Pick  gn_interior_tool.zip  and confirm.
+  5. Tick the checkbox next to  "UltimateMLO"  to enable it.
+  6. Close Preferences.
+
+The tool lives in the 3D viewport's right-hand sidebar. Press  N  in the
+viewport to open the sidebar, then click the  "UltimateMLO"  tab.
+
+  NOTE: install the ZIP, not a loose folder. If you downloaded the whole
+  project from GitHub as a zip, the folder inside is named
+  "gn_interior_tool-main" -- rename it to exactly "gn_interior_tool" before
+  zipping, or just use the provided gn_interior_tool.zip.
+
+
+---------------------------------------------------------------------------
+ 2. THE WINDOW LIBRARY  (already set up)
+---------------------------------------------------------------------------
+
+A library of ready-made windows ships inside the add-on. You do NOT need to
+point at any file -- it just works.
+
+Optional: to share ONE library across several machines or a team, put your
+own window_library.blend somewhere shared and set its path in:
+   Preferences -> Add-ons -> UltimateMLO -> Window Library
+Leave that box EMPTY to keep using the bundled one.
+
+  * Refresh      - reload the library list from disk.
+  * Resync Mesh  - if you edited window meshes in the library file itself,
+                   this pulls the updated geometry into windows already
+                   placed in your current project.
+
+
+---------------------------------------------------------------------------
+ 3. THE WORKFLOW  (top to bottom in the sidebar)
+---------------------------------------------------------------------------
+
+STEP 1 - Set the exterior shell
+   Pick your building's exterior mesh in the "Shell" field (eyedropper).
+
+STEP 2 - Floors & Floor Map
+   Add floor levels (click a facade bottom edge to read its height; the
+   ceiling is auto-placed, or pick two edges for a custom height).
+   "Generate Floor Map" cross-sections the shell into a clean floor outline.
+   You can hand-tidy the outline, then "Save Floor Map as Final".
+
+STEP 3 - Rooms
+   Each floor's outline becomes an editable room. Use "Split at Selected
+   Points" in Edit Mode to cut a room into smaller rooms (partition walls).
+
+STEP 4 - Build Walls
+   Turns the floor map into real 3D room shells.
+
+
+---------------------------------------------------------------------------
+ 4. WINDOWS
+---------------------------------------------------------------------------
+
+There are two ways to place windows, plus editing and curtains.
+
+--- 1. Project from Exterior (automatic) ------------------------------------
+   Select the window pieces on your exterior shell (planes or meshes), then
+   click "Project Selected Pieces" (in the Openings panel).
+   The tool cuts a hole and drops in the best-fitting library window at its
+   TRUE size. The exterior piece is only a size reference -- windows are
+   never stretched. If nothing in the library fits an opening, you get a
+   hole and a message; pick a smaller window for it (see swapping below).
+
+--- 2. Manual Placement -----------------------------------------------------
+   Click a window in the Window Library list to make it "Active", then click
+   "Window Placement Mode". Hover a wall and left-click to drop the active
+   window there. Press Tab while hovering bare wall to cycle windows.
+   Esc / right-click to finish.
+   "Default Window Sill" sets how high windows sit off the floor. A window
+   flagged "Starts at Floor" in the library ignores that and reaches the
+   floor (French / floor-length windows).
+
+--- Swapping a placed window ------------------------------------------------
+   Click a window in the viewport to select it, then click a different
+   window in the Window Library list -- it swaps in place. If the new window
+   doesn't fit an exterior-projected opening, you get an error and nothing
+   changes.
+
+--- Window Edit Mode (move / scale gizmo) -----------------------------------
+   Turn on "Window Edit Mode" and select a window. Drag handles appear on it:
+       GREEN arrow  - slide along the wall
+       BLUE arrow   - raise / lower
+       YELLOW box   - scale (uniform, keeps proportions)
+   Projected windows are clamped to their exterior opening; manually placed
+   windows are free. The wall hole updates when you release.
+
+--- Curtains / Blinds -------------------------------------------------------
+   Select a placed window (in the Openings list or the viewport), pick a
+   curtain/blind in the list, then "Add Curtain". A window only accepts
+   curtains/blinds if its library entry allows them. Overhang and drop are
+   tunable.
+
+
+---------------------------------------------------------------------------
+ 5. REGISTERING YOUR OWN WINDOWS INTO THE LIBRARY
+---------------------------------------------------------------------------
+
+   Select a single window mesh object, then "Register Selected" in the
+   Window Library box. A dialog lets you set:
+       * Name and Category (window / curtain / blinds)
+       * Can Rotate      - may be used both horizontally and vertically
+       * Allows Curtains / Allows Blinds
+       * Starts at Floor  - reaches the floor instead of the default sill
+   The library file is backed up automatically before every change.
+
+   Windows register at their real modelled size. Model them at the size you
+   want them placed -- the tool never rescales them.
+
+
+---------------------------------------------------------------------------
+ 6. NOTES
+---------------------------------------------------------------------------
+
+   * Your interior data (floors, rooms, openings, presets) is stored in the
+     .blend and survives saving/reopening and add-on reloads.
+   * The bundled library lives inside the add-on folder. If you reinstall or
+     update the add-on, windows you registered into the BUNDLED library are
+     replaced -- keep your own shared library file (Preferences path) if you
+     add a lot of custom windows.
+
+===========================================================================

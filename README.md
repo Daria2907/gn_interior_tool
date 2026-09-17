@@ -1,17 +1,45 @@
-# GN Interior Tool (MLO)
+# Ultimate MLO Tool
 
-Exterior-aware interior generator for GTA MLO work in Blender (4.2+, tested on 5.0).
-N-panel: **GN Interior**.
+Exterior-aware interior generator for GTA V MLO work in Blender (4.2+, tested on 5.0).
+Sidebar (press **N**) → **UltimateMLO** tab.
 
-## Pipeline
-1. **Set exterior** shell + **floor levels** (pick a facade bottom edge → base Z, ceiling auto +2.95 m, or pick two edges for a custom height).
-2. **Generate Boundaries** — per floor, cross-section the wall outline, clean it up (Douglas–Peucker), inset the wall margin (20 cm).
-3. **Rooms = Envelope** — each floor's boundary becomes an editable room.
-4. **Split at Selected Edges** — Edit Mode: select two edges on opposite walls → cut the room in two with a partition-wall gap. Recursive, L-shape safe.
-5. **Project Openings** — select separated window/door pieces (planes or meshes) → parametric holes cut into the matching room walls, with optional reveal jambs. Survives splits.
-6. **Doors** (Room-Tool style) — door presets (width/height + optional frame mesh); **Door Edit** snaps a door to the nearest wall and cuts both adjacent rooms (doorway between rooms).
-
-Room data (floors / rooms / openings / presets) is backed up to the scene and restored across add-on reloads.
+Works on Windows, macOS and Linux. A **window library is bundled inside the add-on**,
+so windows work out of the box — nothing to configure.
 
 ## Install
-Blender → Preferences → Add-ons → Install → pick the folder zipped, enable **GN Interior Tool (MLO)**.
+
+Use the ready-to-install ZIP:
+
+1. Blender → **Edit → Preferences → Add-ons**
+2. Drop-down (⌄) → **Install from Disk…** → pick `gn_interior_tool.zip`
+3. Enable **UltimateMLO**
+
+> Install the ZIP, not a loose folder. A GitHub "Download ZIP" unpacks to
+> `gn_interior_tool-main`; rename it to exactly `gn_interior_tool` before zipping,
+> or use the provided `gn_interior_tool.zip`.
+
+**Full usage guide: see [`HOW_TO_USE.txt`](HOW_TO_USE.txt).**
+
+## Pipeline
+
+1. **Set exterior** shell + **floor levels**.
+2. **Generate Floor Map** — cross-section the shell into a clean per-floor outline; hand-tidy, then **Save as Final**.
+3. **Rooms** — each floor's outline becomes an editable room; **Split at Selected Points** carves partitions.
+4. **Build Walls** — real 3D room shells.
+
+## Windows
+
+- **Project from Exterior** — select exterior window pieces → best-fitting library window dropped in at its true size (never stretched); a message if nothing fits.
+- **Manual Placement** — pick a window from the library, click a wall to place it. Default sill height, plus "Starts at Floor" windows.
+- **Swap** — select a placed window, click a different library window to swap it (errors if it won't fit a projected opening).
+- **Window Edit Mode** — gizmo on the selected window: green = slide along wall, blue = up/down, yellow box = uniform scale.
+- **Curtains / Blinds** — added per window, gated by each window's own allow-flags.
+- **Register** your own window meshes into the library (auto-backed-up).
+
+## Window library
+
+Bundled in `window_library/`. To share one library across machines, set a path in
+**Preferences → Add-ons → UltimateMLO → Window Library**; leave empty to use the bundled one.
+
+Interior data (floors / rooms / openings / presets) is stored in the `.blend` and survives
+saving and add-on reloads.

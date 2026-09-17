@@ -1,5 +1,5 @@
 """
-GN Interior Tool - exterior-aware interior generator for GTA MLO.
+UltimateMLO - exterior-aware interior generator for GTA MLO.
 
 Reads an exterior building shell (even a messy non-manifold game asset) and,
 per floor, extracts the outer wall outline, insets it 20 cm, and builds an
@@ -16,12 +16,12 @@ envelope; you carve partitions/doors inside it.
 """
 
 bl_info = {
-    "name": "GN Interior Tool (MLO)",
+    "name": "UltimateMLO",
     "author": "GN's Studio + Claude",
     "version": (0, 1, 0),
     "blender": (4, 2, 0),
-    "location": "3D Viewport > Sidebar (N) > GN Interior",
-    "description": "Exterior-aware interior shell + per-floor boundaries for GTA MLO.",
+    "location": "3D Viewport > Sidebar (N) > UltimateMLO",
+    "description": "Exterior-aware interior shell + per-floor Floor Map for GTA MLO.",
     "category": "Object",
 }
 
@@ -29,6 +29,9 @@ import bpy
 import bmesh
 import math
 import json
+import time
+import shutil
+import os
 import re
 import numpy as np
 import gpu
@@ -38,9 +41,9 @@ from mathutils import Vector, Matrix
 from mathutils.geometry import intersect_line_plane
 from bpy.props import (FloatProperty, IntProperty, StringProperty, BoolProperty,
                        PointerProperty, CollectionProperty, EnumProperty)
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
 
-BOUND_COLL = "GN_Boundaries"
+BOUND_COLL = "GN_FloorMap"
 INT_COLL = "GN_Interiors"
 ROOM_COLL = "GN_Rooms"
 CUTTER_COLL = "GN_Cutters"
@@ -49,6 +52,15 @@ WINDOWFRAME_COLL = "GN_WindowFrames"
 THRESHOLD_COLL = "GN_Thresholds"
 OPENING_PIECES_COLL = "Openings"
 STAIR_COLL = "GN_Stairs"
+WINLIB_COLL = "GN_WindowLibrary"
+CURTAIN_COLL = "GN_Curtains"
+# wall hole is cut this much SMALLER than the placed window frame on every
+# side, so the frame overlaps the rough cut edge (like real window casing
+# over a rough opening) instead of leaving a visible sliver of the hole
+FRAME_OVERLAP = 0.01
+# slack when testing whether a window fits an opening -- float noise, not
+# architecture, and a half-millimetre shortfall shouldn't rule a window out
+FIT_TOL = 0.002
 
 
 # ===========================================================================
@@ -407,6 +419,30 @@ def _line_isect(p0, d0, p1, d1):
     return (p0[0] + d0[0] * t, p0[1] + d0[1] * t)
 
 
+def _shell_dom_orient(ob):
+    """Length-weighted dominant orientation (radians, mod 90deg) of the WHOLE
+    exterior shell, in world space -- computed once from the building as a
+    whole rather than per-floor from each floor's own cross-section, so
+    every floor's boundary snaps to the exact same grid instead of each one
+    independently estimating a slightly different angle (which is what made
+    two floors' boundaries come out a degree or so out of parallel)."""
+    me = ob.data
+    mw = ob.matrix_world
+    sx = sy = 0.0
+    for e in me.edges:
+        a = mw @ me.vertices[e.vertices[0]].co
+        b = mw @ me.vertices[e.vertices[1]].co
+        dx, dy = b.x - a.x, b.y - a.y
+        L = math.hypot(dx, dy)
+        if L < 1e-6:
+            continue
+        ang = math.atan2(dy, dx) % (math.pi / 2)
+        sx += L * math.cos(4 * ang); sy += L * math.sin(4 * ang)
+    if sx == 0 and sy == 0:
+        return 0.0
+    return (math.atan2(sy, sx) / 4.0) % (math.pi / 2)
+
+
 def _dom_orient(poly):
     """Length-weighted dominant orientation (radians, mod 90deg)."""
     sx = sy = 0.0; n = len(poly)
@@ -423,14 +459,17 @@ def _dom_orient(poly):
     return (math.atan2(sy, sx) / 4.0) % (math.pi / 2)
 
 
-def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=False):
+def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=False, th0=None):
     """Straighten walls to the dominant axis and drop short off-grid corner
     chamfers so corners are the two long walls meeting directly. Genuine long
-    angled walls keep their true angle."""
+    angled walls keep their true angle. th0 (radians) can be passed in to use
+    a shared building-wide orientation instead of estimating one from just
+    this polygon -- keeps multiple floors' boundaries mutually parallel."""
     n = len(poly)
     if n < 4:
         return poly
-    th0 = _dom_orient(poly)
+    if th0 is None:
+        th0 = _dom_orient(poly)
     tol = math.radians(ang_tol_deg)
     grid = [th0, th0 + math.pi / 2]
     if allow45:
@@ -462,6 +501,24 @@ def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=Fa
         dot = e[4] * f[4] + e[5] * f[5]
         return abs(cross) < 1e-4 and dot > 0.5
 
+    def fit_dir(points, fallback):
+        # true best-fit direction through every point of a run (principal
+        # axis of their spread), not just the first edge's own angle -- a
+        # long wall walked as many small raster-quantized segments was
+        # otherwise coming out tilted by whatever that one edge's noise was,
+        # visibly off the wall's real line even after "snapping".
+        pts = np.array(points, dtype=np.float64)
+        d = pts - pts.mean(axis=0)
+        cov = d.T @ d
+        if not np.all(np.isfinite(cov)):
+            return fallback
+        evals, evecs = np.linalg.eigh(cov)
+        v = evecs[:, int(np.argmax(evals))]
+        vx, vy = float(v[0]), float(v[1])
+        if vx * fallback[0] + vy * fallback[1] < 0:
+            vx, vy = -vx, -vy
+        return (vx, vy)
+
     start = 0
     for i in range(m):
         if not same_dir(edges[i - 1], edges[i]):
@@ -470,11 +527,24 @@ def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=Fa
     while i < m:
         j = order[i]; dirx, diry = edges[j][4], edges[j][5]
         wx = wy = wsum = 0.0; length = 0.0; k = i
+        pts_for_fit = []
         while k < m and same_dir(edges[order[k]], edges[j]):
             e = edges[order[k]]
             mx = (e[0] + e[2]) / 2; my = (e[1] + e[3]) / 2
             wx += mx * e[6]; wy += my * e[6]; wsum += e[6]; length += e[6]; k += 1
-        runs.append([(wx / wsum, wy / wsum), (dirx, diry), length, edges[j][7]])
+            pts_for_fit.append((e[0], e[1])); pts_for_fit.append((e[2], e[3]))
+        snp = edges[j][7]
+        if len(pts_for_fit) >= 3:
+            dirx, diry = fit_dir(pts_for_fit, (dirx, diry))
+            a = math.atan2(diry, dirx); bestd = 1e9; best = None
+            for g in grid:
+                for gg in (g, g + math.pi):
+                    dd = abs(((a - gg + math.pi) % (2 * math.pi)) - math.pi)
+                    if dd < bestd:
+                        bestd = dd; best = gg
+            if bestd <= tol:
+                dirx, diry = math.cos(best), math.sin(best); snp = True
+        runs.append([(wx / wsum, wy / wsum), (dirx, diry), length, snp])
         i = k
 
     def keep(r):
@@ -530,6 +600,50 @@ def regularize(poly, ang_tol_deg=20.0, min_edge=0.20, corner_max=0.7, allow45=Fa
     return cleaned if len(cleaned) >= 3 else poly
 
 
+def _rectify_diagonals(poly, th0, ang_tol_deg=2.0, max_len=3.0, min_len=0.2):
+    """Replace any short edge that isn't aligned to the building's grid with
+    a right-angle step along that grid instead of leaving it as a diagonal
+    cut -- these are raster-staircase artifacts through a real notch/step in
+    the wall, not genuine angled architecture (which is long and gets left
+    alone via max_len). Keeps the notch's shape and position, just made of
+    two straight, grid-aligned segments instead of one diagonal one.
+    Edges shorter than min_len are pure noise below the level of any real
+    feature -- welded away instead of turned into an even-more-visible tiny
+    right-angle tooth."""
+    ux, uy = math.cos(th0), math.sin(th0)
+    vx, vy = -uy, ux
+    tol = math.radians(ang_tol_deg)
+    n = len(poly)
+    out = []
+    skip_next = False
+    for i in range(n):
+        a = poly[i]; b = poly[(i + 1) % n]
+        if skip_next:
+            skip_next = False
+        else:
+            out.append(a)
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(dx, dy)
+        if L < 1e-6 or L > max_len:
+            continue
+        if L < min_len:
+            # too short to be a real feature whether or not it happens to
+            # already be grid-aligned -- e.g. a stray residual left where
+            # two surviving runs' corner reconstruction didn't quite meet.
+            # Weld it away rather than keep it as a visible tiny tooth.
+            skip_next = True
+            continue
+        ang = math.atan2(dy, dx)
+        bestd = min(abs(((ang - (th0 + k * math.pi / 2) + math.pi) % (2 * math.pi)) - math.pi)
+                    for k in range(4))
+        if bestd <= tol:
+            continue
+        du = dx * ux + dy * uy
+        corner = (a[0] + du * ux, a[1] + du * uy)
+        out.append(corner)
+    return out if len(out) >= 3 else poly
+
+
 def _turn_angle(a, b, c):
     """Deviation (deg) from straight at b: 0 = straight, 90 = corner, 180 = reversal."""
     v1x, v1y = b[0] - a[0], b[1] - a[1]
@@ -565,13 +679,16 @@ def _despike(poly, straight_deg=6.0, spike_deg=150.0, tooth_deg=30.0, tooth_len=
 
 
 def raster_footprint(segs, tol=0.15, cell=0.05, seed=None, bridge=0.5,
-                     square=True, ang_tol_deg=20.0, allow45=False):
+                     square=True, ang_tol_deg=20.0, allow45=False, th0=None):
     """segs -> ONE clean CCW footprint polygon [(x,y),...] (world units), or None.
 
     tol    = detail size to ignore (metres).
     bridge = max wall gap/hole to seal (metres).
     seed   = (x, y) interior point to disambiguate which region is the building.
     square = rectilinearize the result (straight walls, crisp corners).
+    th0    = shared building orientation (radians) to snap to -- keeps
+             multiple floors mutually parallel; None = estimate from this
+             floor's own cross-section only.
     """
     if not segs:
         return None
@@ -617,7 +734,17 @@ def raster_footprint(segs, tol=0.15, cell=0.05, seed=None, bridge=0.5,
     if square:
         poly = regularize(poly, ang_tol_deg=ang_tol_deg,
                           min_edge=max(tol, 0.15), corner_max=max(tol * 4, 0.7),
-                          allow45=allow45)
+                          allow45=allow45, th0=th0)
+        if not allow45 and len(poly) >= 4:
+            # welding away one tiny edge can leave a fresh tiny residual
+            # where its neighbours now meet -- iterate to a fixed point
+            fixed_th0 = th0 if th0 is not None else _dom_orient(poly)
+            for _ in range(5):
+                nxt = _rectify_diagonals(poly, fixed_th0)
+                if len(nxt) == len(poly):
+                    break
+                poly = nxt
+            poly = nxt
     if _r_area(poly) < 0:
         poly = poly[::-1]
     return poly
@@ -638,6 +765,20 @@ def _clear_coll(name):
     if c:
         for ob in list(c.objects):
             bpy.data.objects.remove(ob, do_unlink=True)
+
+
+def _remove_coll_if_empty(name):
+    """Delete the collection entirely once it has nothing left in it, instead
+    of leaving an empty husk sitting in the Outliner forever (GN_Thresholds/
+    GN_DoorFrames/GN_WindowFrames only ever get individual objects removed
+    from them as doors/windows/openings are deleted, never the collection
+    itself)."""
+    c = bpy.data.collections.get(name)
+    if c and not c.objects and not c.children:
+        try:
+            bpy.data.collections.remove(c)
+        except Exception:
+            pass
 
 
 def _clear_named(coll, name):
@@ -664,9 +805,11 @@ class GN_FloorLevel(PropertyGroup):
     top_is_custom: BoolProperty(default=False,
         description="Use this floor's explicit Top Z instead of base + Room Height")
     bound_json: StringProperty(default="")   # inset boundary polygon [[x,y],...]
-    lock: BoolProperty(name="Lock", default=False,
-        description="Lock this floor's boundary: Generate Boundaries skips it so "
-        "hand edits are preserved")
+    lock: BoolProperty(name="Saved as Final", default=False,
+        description="This floor's map was saved as final (via 'Save Floor "
+        "Map as Final' after hand-correcting it) -- Generate Floor Map will "
+        "ask for confirmation before overwriting it. Set automatically, not "
+        "meant to be toggled by hand")
 
 
 class GN_Room(PropertyGroup):
@@ -677,6 +820,13 @@ class GN_Room(PropertyGroup):
         description="Vertical shift from the floor's own base/top (for a "
         "half-floor / mezzanine room). Set by grabbing and moving the room "
         "object in Z -- rebuild_rooms detects and re-applies it")
+    lock: BoolProperty(default=False,
+        description="Keep this room's mesh exactly as hand-edited -- "
+        "rebuild_rooms() skips it entirely instead of rebuilding it from "
+        "poly_json (which would discard a manual resize). Its door/window "
+        "holes also stop updating while locked")
+    openings_expanded: BoolProperty(default=True,
+        description="Expand this room's group in the Openings panel")
 
 
 class GN_Opening(PropertyGroup):
@@ -690,6 +840,18 @@ class GN_Opening(PropertyGroup):
     uid: IntProperty(default=0)
     is_door: BoolProperty(default=False)
     projected: BoolProperty(default=False)   # from an exterior piece (no threshold)
+    win_w: FloatProperty(default=0.0)   # actual placed window frame size, if any
+    win_h: FloatProperty(default=0.0)   # (0 = no window placed -- curtains fall back to hw*2/top-sill)
+    win_allow_curtain: BoolProperty(default=True)   # from the placed window preset's own flags
+    win_allow_blinds: BoolProperty(default=True)
+    # the ORIGINAL exterior piece's own bounds -- the space a swapped-in
+    # window still has to fit inside. hw/sill/top can't answer that any more:
+    # they're sized to the window actually placed, not the piece it came
+    # from. 0 = unconstrained (a manually placed window has no piece).
+    avail_w: FloatProperty(default=0.0)
+    avail_h: FloatProperty(default=0.0)
+    win_key: StringProperty(default="")   # which candidate is placed here
+    win_rotated: BoolProperty(default=False)   # placed sideways (can_rotate)
 
 
 class GN_DoorPreset(PropertyGroup):
@@ -708,6 +870,51 @@ class GN_WindowPreset(PropertyGroup):
         description="Height of the window bottom above the floor")
     mesh_object: PointerProperty(name="Frame Mesh", type=bpy.types.Object,
         description="Optional window mesh placed as a linked instance at each opening")
+    library_key: StringProperty(default="",
+        description="Catalog key this preset was pulled from the shared "
+        "Window Library with, if any -- empty for hand-made presets")
+    can_rotate: BoolProperty(default=False,
+        description="Can be used both horizontal and vertical -- auto-fit "
+        "also tries it sideways and uses whichever orientation fits better")
+    allow_curtain: BoolProperty(default=True,
+        description="This window supports having a curtain added to it")
+    allow_blinds: BoolProperty(default=True,
+        description="This window supports having blinds added to it")
+    starts_at_floor: BoolProperty(default=False,
+        description="Starts at the room's floor instead of the scene's "
+        "default window sill height (e.g. a French window/floor-length "
+        "window) -- only affects manual placement")
+
+
+class GN_WindowLibItem(PropertyGroup):
+    """One catalog entry mirrored from the shared Window Library's JSON
+    sidecar into the scene, purely for the browse-list UI -- rescan_window_
+    library() rebuilds this from disk, nothing here is authoritative."""
+    name: StringProperty()
+    key: StringProperty()
+    object_name: StringProperty()
+    width: FloatProperty()
+    height: FloatProperty()
+    sill: FloatProperty()
+    category: StringProperty()
+    can_rotate: BoolProperty(default=False)
+    allow_curtain: BoolProperty(default=True)
+    allow_blinds: BoolProperty(default=True)
+    starts_at_floor: BoolProperty(default=False)
+
+
+class GN_CurtainPreset(PropertyGroup):
+    """A curtain/blind pulled from the shared library. No width/height/sill
+    fields (unlike GN_WindowPreset) -- sizing is fully dynamic per opening,
+    computed by overhanging whatever window is actually placed there."""
+    name: StringProperty(default="Curtain")
+    mesh_object: PointerProperty(name="Mesh", type=bpy.types.Object,
+        description="Curtain/blind mesh placed as a linked instance, "
+        "overhanging the placed window")
+    library_key: StringProperty(default="")
+    category: StringProperty(default="",
+        description="'curtain' or 'blinds', copied from the library entry -- "
+        "used to check the placed window's own allow_curtain/allow_blinds")
 
 
 _SUSPEND_CB = False
@@ -743,7 +950,7 @@ def _cb_threshold(self, context):
         try:
             _refresh_thresholds(_SceneCtx(scene))
         except Exception as e:
-            print("[GN Interior] threshold update:", e)
+            print("[UltimateMLO] threshold update:", e)
         return None
 
     bpy.app.timers.register(_do, first_interval=0.0)
@@ -774,7 +981,7 @@ def _cb_stair_settings(self, context):
                 try:
                     _rebuild_stair_mesh(ob, height, depth, nosing)
                 except Exception as e:
-                    print("[GN Interior] stair update:", e)
+                    print("[UltimateMLO] stair update:", e)
         return None
 
     bpy.app.timers.register(_do, first_interval=0.0)
@@ -840,6 +1047,13 @@ def _cb_floor_select(self, context):
         s = scene.gn_int
         if s.floor_index != idx or not (0 <= idx < len(s.floors)):
             return None
+        # if the viewport's active object already belongs to this floor, this
+        # sync came from the REVERSE direction (a viewport/Outliner click, via
+        # _gn_active_object_changed) -- don't deselect-and-reselect, or a
+        # shift-click multi-selection gets clobbered on every second click
+        active = bpy.context.view_layer.objects.active
+        if active is not None and _floor_index_for_object(active, s) == idx:
+            return None
         try:
             for ob in bpy.context.selectable_objects:
                 ob.select_set(False)
@@ -878,6 +1092,165 @@ def _cb_floor_select(self, context):
     bpy.app.timers.register(_do, first_interval=0.0)
 
 
+def _cb_room_select(self, context):
+    """Selecting a room in the list selects its object in the scene -- same
+    deferred-timer pattern as _cb_floor_select, for the same reentrancy
+    reason."""
+    scene_name = context.scene.name
+    idx = context.scene.gn_int.room_index
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        s = scene.gn_int
+        if s.room_index != idx or not (0 <= idx < len(s.rooms)):
+            return None
+        # reverse-direction sync landed here (see _cb_floor_select) -- don't
+        # clobber a shift-click multi-selection
+        active = bpy.context.view_layer.objects.active
+        if active is not None and _room_index_for_object(active, s) == idx:
+            return None
+        uid = s.rooms[idx].uid
+        room_coll = bpy.data.collections.get(ROOM_COLL)
+        ob = None
+        if room_coll:
+            ob = next((o for o in room_coll.objects if o.get("gn_room_uid") == uid), None)
+        if ob is None:
+            # no built wall yet -- the room is just a face on the shared
+            # Floor Map object, so fall back to selecting that instead
+            fidx = s.rooms[idx].floor_index
+            if 0 <= fidx < len(s.floors):
+                ob = _boundary_object_for_floor(s.floors[fidx])
+        if ob is None:
+            return None
+        try:
+            for o in bpy.context.selectable_objects:
+                o.select_set(False)
+            ob.select_set(True)
+            bpy.context.view_layer.objects.active = ob
+            for w in bpy.context.window_manager.windows:
+                for a in w.screen.areas:
+                    if a.type == 'VIEW_3D':
+                        a.tag_redraw()
+        except Exception:
+            pass
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
+def _floor_index_for_object(ob, s):
+    """Reverse of _cb_floor_select's own lookup -- given the object that just
+    became active (e.g. from a viewport click), return which floor index it
+    belongs to, or None if it isn't a floor's boundary or one of its rooms."""
+    if ob is None:
+        return None
+    me = ob.data
+    if ob.name.startswith("GN_FloorMap_Floor") and me and len(me.vertices):
+        z0 = (ob.matrix_world @ me.vertices[0].co).z
+        best_i, best_d = None, 1e9
+        for i, f in enumerate(s.floors):
+            d = abs(f.z - z0)
+            if d < best_d:
+                best_d = d; best_i = i
+        return best_i if best_d < 0.5 else None
+    uid = ob.get("gn_room_uid")
+    if uid is not None:
+        for r in s.rooms:
+            if r.uid == uid:
+                return r.floor_index
+    return None
+
+
+def _room_index_for_object(ob, s):
+    """Reverse of _cb_room_select's own lookup -- global index into s.rooms
+    for the object that just became active, or None if it isn't a room."""
+    if ob is None:
+        return None
+    uid = ob.get("gn_room_uid")
+    if uid is None:
+        return None
+    for i, r in enumerate(s.rooms):
+        if r.uid == uid:
+            return i
+    return None
+
+
+def _opening_index_for_object(ob, s):
+    """Index into s.openings for the object that just became active, parsed
+    from the GN_Frame_<uid> / GN_Threshold_<uid> naming _cb_opening_select
+    itself uses to find these objects -- there's no custom-prop tag on them,
+    just the name-encoded uid (matching _remove_frame_mesh/_remove_threshold)."""
+    if ob is None:
+        return None
+    for prefix in ("GN_Frame_", "GN_Threshold_"):
+        if ob.name.startswith(prefix):
+            try:
+                uid = int(ob.name[len(prefix):].split(".")[0])
+            except ValueError:
+                return None
+            for i, op in enumerate(s.openings):
+                if op.uid == uid:
+                    return i
+    return None
+
+
+def _portal_index_for_object(ob, scene):
+    """Index into the MLO portals collection for the object that just became
+    active, or None if it isn't a portal."""
+    if ob is None:
+        return None
+    coll = _mlo_portals_collection(scene)
+    if not coll:
+        return None
+    for i, o in enumerate(coll.objects):
+        if o == ob:
+            return i
+    return None
+
+
+_GN_MSGBUS_OWNER = object()
+
+
+def _sync_lists_from_active(scene):
+    """Point each list at whatever object is active: a floor's boundary ->
+    Floors, a room/wall -> Rooms, an opening's frame/threshold -> Openings,
+    a portal -> Portals. The reverse direction of each _cb_*_select callback.
+    Called from BOTH the msgbus subscription and the depsgraph handler --
+    msgbus alone doesn't fire for every selection change, which left the
+    Openings list (and so the window-swap target) pointing at the wrong
+    window after clicking a frame in the viewport."""
+    if not scene or not hasattr(scene, "gn_int"):
+        return
+    s = scene.gn_int
+    vl = bpy.context.view_layer
+    ob = vl.objects.active if vl else None
+    if ob is None:
+        return
+    fidx = _floor_index_for_object(ob, s)
+    if fidx is not None and fidx != s.floor_index and 0 <= fidx < len(s.floors):
+        s.floor_index = fidx
+    ridx = _room_index_for_object(ob, s)
+    if ridx is not None and ridx != s.room_index and 0 <= ridx < len(s.rooms):
+        s.room_index = ridx
+    oidx = _opening_index_for_object(ob, s)
+    if oidx is not None and oidx != s.opening_index and 0 <= oidx < len(s.openings):
+        s.opening_index = oidx
+    pidx = _portal_index_for_object(ob, scene)
+    if pidx is not None and pidx != s.portal_index:
+        s.portal_index = pidx
+
+
+def _gn_active_object_changed():
+    """msgbus callback -- deferred via a timer for the same undo/reentrancy
+    reason as every other callback in this file."""
+    def _do():
+        _sync_lists_from_active(bpy.context.scene)
+        return None
+    bpy.app.timers.register(_do, first_interval=0.0)
+
+
 def _cb_portal_select(self, context):
     """Selecting a portal in the list selects that object, so the Outliner
     and viewport highlight what you're looking at. Deferred via a timer for
@@ -894,6 +1267,11 @@ def _cb_portal_select(self, context):
             return None
         coll = _mlo_portals_collection(scene)
         if not coll or not (0 <= idx < len(coll.objects)):
+            return None
+        # reverse-direction sync landed here (see _cb_floor_select) -- don't
+        # clobber a shift-click multi-selection
+        active = bpy.context.view_layer.objects.active
+        if active is not None and _portal_index_for_object(active, scene) == idx:
             return None
         try:
             for ob in bpy.context.selectable_objects:
@@ -927,6 +1305,46 @@ def _cb_redraw(self, context):
                     a.tag_redraw()
     except Exception:
         pass
+
+
+def _cb_opening_select(self, context):
+    """Selecting an opening in the list also selects its frame/threshold
+    object (if either exists) so the Outliner highlights it too -- openings
+    only ever had a custom-drawn viewport highlight before, with no real
+    Outliner/scene selection. Same deferred-timer pattern as the other
+    _cb_*_select callbacks."""
+    _cb_redraw(self, context)
+    scene_name = context.scene.name
+    idx = context.scene.gn_int.opening_index
+
+    def _do():
+        scene = bpy.data.scenes.get(scene_name)
+        if not scene or not hasattr(scene, "gn_int"):
+            return None
+        s = scene.gn_int
+        if s.opening_index != idx or not (0 <= idx < len(s.openings)):
+            return None
+        uid = s.openings[idx].uid
+        picked = [ob for ob in (bpy.data.objects.get(f"GN_Frame_{uid}"),
+                                bpy.data.objects.get(f"GN_Threshold_{uid}")) if ob]
+        if not picked:
+            return None
+        # reverse-direction sync landed here (see _cb_floor_select) -- don't
+        # clobber a shift-click multi-selection
+        active = bpy.context.view_layer.objects.active
+        if active is not None and active in picked:
+            return None
+        try:
+            for ob in bpy.context.selectable_objects:
+                ob.select_set(False)
+            for ob in picked:
+                ob.select_set(True)
+            bpy.context.view_layer.objects.active = picked[0]
+        except Exception:
+            pass
+        return None
+
+    bpy.app.timers.register(_do, first_interval=0.0)
 
 
 _ROOM_NAME_RE = re.compile(r'^r\d+$', re.IGNORECASE)
@@ -970,6 +1388,59 @@ def _gn_room_number_from_name(room_name):
     return m.group(1) if m else room_name
 
 
+def _winlib_index_update(self, context):
+    """Clicking a row in the Window Library list (template_list's own
+    click-to-select) picks it immediately -- no separate 'Pick' click.
+    Windows only: pulls the entry into the project if it isn't already
+    there and makes it the active window for Window Edit Mode, same as
+    GN_OT_win_lib_add_to_project. Curtains/blinds are left alone here --
+    they stay an explicit opt-in via their own Add button, since a window
+    doesn't automatically get dressing just because it's now selected in
+    a shared list. Called through the module namespace (not a direct name
+    reference) so this can sit above _pull_library_entry_into_project's
+    own definition without an ordering problem -- the name only needs to
+    resolve once this actually fires, by which point the module is fully
+    loaded."""
+    s = self
+    if not (0 <= s.winlib_index < len(s.winlib_items)):
+        return
+    entry = s.winlib_items[s.winlib_index]
+    if entry.category in _CURTAIN_CATEGORIES:
+        # picking a curtain only makes it the ACTIVE one -- putting it on a
+        # window is still the separate, explicit Add Curtain step
+        existing_idx = next((i for i, p in enumerate(s.curtain_presets)
+                             if p.library_key == entry.key), -1)
+        if existing_idx >= 0:
+            s.active_curtain_preset = existing_idx
+        else:
+            _pull_library_entry_into_project(context, entry)
+        return
+    # a window opening selected? clicking a library row swaps THAT window for
+    # this one (the operator reports if it doesn't fit the exterior opening).
+    # Either way the row also becomes the active window for placing new ones.
+    sel = (s.openings[s.opening_index]
+           if 0 <= s.opening_index < len(s.openings) else None)
+    if sel is not None and not sel.is_door:
+        # deferred: this runs during a UI property update, where an operator
+        # that rebuilds meshes can't safely run inline (same timer pattern as
+        # the _cb_*_select callbacks)
+        key, oi = entry.key, s.opening_index
+
+        def _do_swap():
+            try:
+                bpy.ops.gn_int.swap_window(key=key, index=oi)
+            except Exception as e:
+                print("[UltimateMLO] swap failed:", e)
+            return None
+        bpy.app.timers.register(_do_swap, first_interval=0.0)
+    existing_idx = next((i for i, p in enumerate(s.window_presets)
+                         if p.library_key == entry.key), -1)
+    if existing_idx >= 0:
+        s.active_window_preset = existing_idx
+        return
+    _pull_library_entry_into_project(context, entry)
+
+
 class GN_IntProps(PropertyGroup):
     exterior: PointerProperty(name="Exterior Shell", type=bpy.types.Object,
         description="The exterior building shell to read")
@@ -984,13 +1455,13 @@ class GN_IntProps(PropertyGroup):
         unit='LENGTH', description="Simplify the outline: remove wiggles/slivers "
         "smaller than this (metres). Keeps real corners. 0 = exact outline")
     detail_tol: FloatProperty(name="Ignore Details <", default=0.15, min=0.0, max=1.0,
-        unit='LENGTH', description="Boundary: ignore wall detail smaller than this "
+        unit='LENGTH', description="Floor Map: ignore wall detail smaller than this "
         "(window reveals, tiny jogs). Bigger = simpler outline")
     bridge: FloatProperty(name="Bridge Gaps <", default=0.5, min=0.0, max=3.0,
-        unit='LENGTH', description="Boundary: seal holes and gaps in the shell up "
+        unit='LENGTH', description="Floor Map: seal holes and gaps in the shell up "
         "to this size (non-manifold buildings, missing walls)")
     square: BoolProperty(name="Square Walls", default=True,
-        description="Boundary: straighten walls to the building's main axis and "
+        description="Floor Map: straighten walls to the building's main axis and "
         "make corners crisp (recommended). Off = follow the raw outline")
     ang_tol: FloatProperty(name="Square Angle", default=20.0, min=0.0, max=45.0,
         description="A wall within this many degrees of the main axis is "
@@ -1005,10 +1476,10 @@ class GN_IntProps(PropertyGroup):
         description="Interior name -> collection 'int_<name>', shell empty "
         "'<name>_shell'. Run this once, after rooms/doors are finished",
         update=_cb_mlo_name)
-    timecycle_name: StringProperty(name="Timecycle", default="",
-        description="RageKit room timecycle name (optional). Prefilled from "
-        "MLO Name until you edit it yourself", update=_cb_timecycle_name)
-    timecycle_auto: BoolProperty(default=True, options={'HIDDEN'},
+    timecycle_name: StringProperty(name="Timecycle", default="int_gasstation",
+        description="RageKit room timecycle name. Defaults to int_gasstation "
+        "until you edit it yourself", update=_cb_timecycle_name)
+    timecycle_auto: BoolProperty(default=False, options={'HIDDEN'},
         description="Internal: Timecycle is still following MLO Name")
 
     # ── Add Empties ─────────────────────────────────────────────────────
@@ -1073,10 +1544,10 @@ class GN_IntProps(PropertyGroup):
     snap: FloatProperty(name="Grid Snap", default=0.10, min=0.0, max=1.0,
         unit='LENGTH', description="Round drawn room corners to this grid (0 = off)")
     rooms: CollectionProperty(type=GN_Room)
-    room_index: IntProperty(default=0)
+    room_index: IntProperty(default=0, update=_cb_room_select)
     uid_counter: IntProperty(default=1)
     openings: CollectionProperty(type=GN_Opening)
-    opening_index: IntProperty(default=0, update=_cb_redraw)
+    opening_index: IntProperty(default=0, update=_cb_opening_select)
     portal_index: IntProperty(default=0, update=_cb_portal_select)
     show_portal_list: BoolProperty(default=True)
     opening_filter: EnumProperty(name="Filter", default='ALL',
@@ -1089,6 +1560,27 @@ class GN_IntProps(PropertyGroup):
     active_door_preset: IntProperty(default=0)
     window_presets: CollectionProperty(type=GN_WindowPreset)
     active_window_preset: IntProperty(default=0)
+    win_edit_mode: BoolProperty(name="Window Edit Mode", default=False,
+        description="Show a move/scale gizmo on the selected window so you can "
+        "slide it along the wall, raise/lower it, and scale it uniformly")
+    default_window_sill: FloatProperty(name="Default Window Sill", default=0.9,
+        min=0.0, max=4.0, unit='LENGTH',
+        description="Standard height manually-placed windows start at, unless "
+        "the active window is flagged 'Starts at Floor' in the library")
+    winlib_items: CollectionProperty(type=GN_WindowLibItem)
+    winlib_index: IntProperty(default=0, update=_winlib_index_update)
+    curtain_presets: CollectionProperty(type=GN_CurtainPreset)
+    active_curtain_preset: IntProperty(default=0)
+    curtain_side_overhang: FloatProperty(name="Side Overhang", default=0.15,
+        min=0.0, max=1.0, unit='LENGTH',
+        description="How far the curtain/blind extends past each side of the placed window")
+    curtain_top_overhang: FloatProperty(name="Top Overhang", default=0.15,
+        min=0.0, max=1.0, unit='LENGTH',
+        description="How far the curtain/blind extends above the placed window")
+    curtain_bottom_drop: FloatProperty(name="Bottom Drop", default=0.0,
+        min=0.0, max=3.0, unit='LENGTH',
+        description="How far below the window sill the curtain/blind extends "
+        "(0 = stops at the sill, larger = floor-length)")
     add_threshold: BoolProperty(name="Door Threshold", default=False,
         description="Place a low floor strip across the bottom of each door opening",
         update=_cb_threshold)
@@ -1149,9 +1641,10 @@ class GN_OT_add_floor_sel(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Add Floor from Selected Edge"
     bl_description = ("Add a floor level at the Z of the selected geometry "
-                      "(select a facade edge in Edit Mode). Height is always "
-                      "Room Height - use the floor list's Top field for a custom "
-                      "height on a specific floor")
+                      "(select a facade edge in Edit Mode) and immediately "
+                      "generate its floor map too, if a Shell is set. Height is "
+                      "always Room Height - use the floor list's Top field for "
+                      "a custom height on a specific floor")
 
     def execute(self, context):
         ob = context.active_object
@@ -1167,9 +1660,14 @@ class GN_OT_add_floor_sel(Operator):
         base = min((ob.matrix_world @ v.co).z for v in sel)
         it = s.floors.add()
         it.z = round(base, 3)
+        new_z = it.z
         _sort_floors(s)
-        self.report({'INFO'}, f"Added floor at z={base:.2f} (height = Room Height, "
-                              f"{s.room_height:.2f} m)")
+        _select_floor_by_z(s, new_z)
+        msg = f"Added floor at z={base:.2f} (height = Room Height, {s.room_height:.2f} m)"
+        if s.exterior:
+            bpy.ops.gn_int.gen_boundaries()
+            msg += " + generated floor map"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -1185,7 +1683,9 @@ class GN_OT_add_floor_z(Operator):
         s = context.scene.gn_int
         it = s.floors.add()
         it.z = round(s.new_floor_z, 3)
+        new_z = it.z
         _sort_floors(s)
+        _select_floor_by_z(s, new_z)
         self.report({'INFO'}, f"Added floor at z={s.new_floor_z:.2f}")
         return {'FINISHED'}
 
@@ -1214,8 +1714,9 @@ class GN_OT_pick_floor_z(Operator):
     bl_label = "Slice for Floor Height"
     bl_description = ("Drag to slide a live cross-section up/down through the "
                       "exterior and see the real wall outline at each height, "
-                      "then click to add a floor there. The exterior mesh is "
-                      "never modified - only a throwaway copy is cut for preview")
+                      "then click to add a floor there and immediately generate "
+                      "its floor map too. The exterior mesh is never modified - "
+                      "only a throwaway copy is cut for preview")
 
     def invoke(self, context, event):
         s = context.scene.gn_int
@@ -1232,6 +1733,12 @@ class GN_OT_pick_floor_z(Operator):
             start = min((ex.matrix_world @ v.co).z for v in ex.data.vertices)
         self._z = start
         self._segs = _cut_segments(self._src, self._z)
+        # world XY the slice height is measured at -- the exterior's own
+        # bounding-box center. Only used as the fixed reference column for
+        # turning the mouse cursor into a Z height (see modal()); doesn't
+        # affect the slice itself, which always spans the full cross-section.
+        corners = [ex.matrix_world @ Vector(c) for c in ex.bound_box]
+        self._ref_xy = (sum(c.x for c in corners) / 8, sum(c.y for c in corners) / 8)
         self._last_mouse_y = event.mouse_y
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw_slice_overlay, (self, context), 'WINDOW', 'POST_VIEW')
@@ -1253,10 +1760,24 @@ class GN_OT_pick_floor_z(Operator):
 
     def modal(self, context, event):
         if event.type == 'MOUSEMOVE':
-            dy = event.mouse_y - self._last_mouse_y
+            # slice height follows the cursor directly: cast the mouse
+            # position through the view onto a vertical line at the
+            # exterior's XY center, at the slice's current depth -- so the
+            # drawn line tracks under the mouse instead of drifting off via
+            # an accumulated relative delta (which is what made the slice
+            # end up far from the cursor before).
+            region, rv3d = context.region, context.region_data
+            coord = (event.mouse_region_x, event.mouse_region_y)
+            depth = Vector((self._ref_xy[0], self._ref_xy[1], self._z))
+            loc = view3d_utils.region_2d_to_location_3d(region, rv3d, coord, depth)
+            if event.shift:
+                # fine control: only take a fraction of the cursor's move
+                # since last frame, instead of snapping straight to it
+                dy = event.mouse_y - self._last_mouse_y
+                self._z += dy * 0.001
+            else:
+                self._z = loc.z
             self._last_mouse_y = event.mouse_y
-            sens = 0.001 if event.shift else 0.01
-            self._z += dy * sens
             self._retag(context)
             return {'RUNNING_MODAL'}
         if event.type == 'WHEELUPMOUSE' and event.value == 'PRESS':
@@ -1285,8 +1806,14 @@ class GN_OT_pick_floor_z(Operator):
         s = context.scene.gn_int
         it = s.floors.add()
         it.z = round(z, 3)
+        new_z = it.z
         _sort_floors(s)
-        self.report({'INFO'}, f"Added floor at z={z:.3f}")
+        _select_floor_by_z(s, new_z)
+        msg = f"Added floor at z={z:.3f}"
+        if s.exterior:
+            bpy.ops.gn_int.gen_boundaries()
+            msg += " + generated floor map"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -1299,8 +1826,22 @@ class GN_OT_remove_floor(Operator):
     def execute(self, context):
         s = context.scene.gn_int
         if 0 <= self.index < len(s.floors):
+            bnd = _boundary_object_for_floor(s.floors[self.index])
+            if bnd:
+                bpy.data.objects.remove(bnd, do_unlink=True)
             s.floors.remove(self.index)
         return {'FINISHED'}
+
+
+def _select_floor_by_z(s, z, tol=1e-3):
+    """Point floor_index at the floor closest to z (after _sort_floors has
+    re-shuffled indices) so a newly added floor ends up selected in the list
+    instead of leaving whatever was selected before."""
+    if not s.floors:
+        return
+    best_i = min(range(len(s.floors)), key=lambda i: abs(s.floors[i].z - z))
+    if abs(s.floors[best_i].z - z) <= max(tol, 0.01):
+        s.floor_index = best_i
 
 
 def _sort_floors(s):
@@ -1335,9 +1876,18 @@ def _floor_tops(context):
 class GN_OT_gen_boundaries(Operator):
     bl_idname = "gn_int.gen_boundaries"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Generate Boundaries"
-    bl_description = ("Create the boundary outline for the SELECTED floor only "
+    bl_label = "Generate Floor Map"
+    bl_description = ("Create the Floor Map outline for the SELECTED floor only "
                       "(exterior inset by the margin). Other floors are untouched")
+
+    def invoke(self, context, event):
+        s = context.scene.gn_int
+        if 0 <= s.floor_index < len(s.floors) and s.floors[s.floor_index].lock:
+            return context.window_manager.invoke_confirm(
+                self, event,
+                message=f"Floor {s.floor_index + 1}'s map was saved as final -- "
+                        "regenerating it will discard your corrections. Continue?")
+        return self.execute(context)
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -1349,9 +1899,6 @@ class GN_OT_gen_boundaries(Operator):
             self.report({'ERROR'}, "Select a floor in the list")
             return {'CANCELLED'}
         target = s.floors[s.floor_index]
-        if target.lock and target.bound_json:
-            self.report({'INFO'}, "Floor is locked - boundary kept as-is")
-            return {'CANCELLED'}
         # find this floor's (base, top) among the z-sorted, gap-honoring list
         tops = _floor_tops(context)
         sorted_idx = sorted(range(len(s.floors)), key=lambda k: s.floors[k].z)
@@ -1362,9 +1909,14 @@ class GN_OT_gen_boundaries(Operator):
         coll = _get_coll(BOUND_COLL)
         zc = base + s.sample_offset
         segs = _cut_segments(src, zc)
+        # one shared orientation for the whole building, not re-estimated
+        # per floor -- otherwise each floor's cross-section can land a
+        # fraction of a degree apart and their boundaries stop being
+        # mutually parallel even though they're straight individually.
+        th0 = _shell_dom_orient(ex) if s.square else None
         poly_t = raster_footprint(
             segs, tol=s.detail_tol, cell=0.05, seed=None, bridge=s.bridge,
-            square=s.square, ang_tol_deg=s.ang_tol, allow45=s.allow45)
+            square=s.square, ang_tol_deg=s.ang_tol, allow45=s.allow45, th0=th0)
         fell_back = False
         if not poly_t or len(poly_t) < 3:
             old = outer_footprint(src, zc)
@@ -1378,14 +1930,69 @@ class GN_OT_gen_boundaries(Operator):
         poly = [Vector(p) for p in poly_t]
         ip = _weld_loop(inset_loop(poly, s.wall_margin),
                         max(s.detail_tol * 0.4, 0.005))
-        _clear_named(coll, f"GN_Bound_Floor{pos+1}")
-        _make_loop_object(coll, f"GN_Bound_Floor{pos+1}", ip, base)
+        _clear_named(coll, f"GN_FloorMap_Floor{pos+1}")
+        _make_face_object(coll, f"GN_FloorMap_Floor{pos+1}", ip, base)
         target.bound_json = json.dumps(
             [[round(p.x, 4), round(p.y, 4)] for p in ip])
-        msg = f"Generated boundary for Floor {s.floor_index+1}"
+        target.lock = False   # this floor is no longer the saved-as-final shape
+        # a fresh Floor Map should already be one splittable room -- no extra
+        # "Reset Room Outline" click needed just to get started
+        seed_rooms_from_boundaries(context, s.floor_index)
+        msg = f"Generated floor map for Floor {s.floor_index+1}"
         if fell_back:
             msg += " (fell back to legacy method)"
         self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class GN_OT_save_floor_map_final(Operator):
+    bl_idname = "gn_int.save_floor_map_final"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Save Floor Map as Final"
+    bl_description = ("Capture the selected floor's Floor Map exactly as it "
+                      "currently is (after hand-correcting it in Edit Mode) "
+                      "as the saved-as-final shape. Generate Floor Map will "
+                      "then ask before overwriting it. Only works before the "
+                      "floor has been split into rooms -- reset the room "
+                      "outline first if it already has")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        if not (0 <= s.floor_index < len(s.floors)):
+            self.report({'ERROR'}, "Select a floor in the list")
+            return {'CANCELLED'}
+        target = s.floors[s.floor_index]
+        fm_ob = _boundary_object_for_floor(target)
+        if fm_ob is None:
+            self.report({'ERROR'}, "No Floor Map found for this floor")
+            return {'CANCELLED'}
+        me = fm_ob.data
+        if len(me.polygons) != 1:
+            self.report({'ERROR'},
+                "Floor Map has been split into rooms -- click 'Reset Room "
+                "Outline' first, then correct and save the whole-floor shape")
+            return {'CANCELLED'}
+        mat = fm_ob.matrix_world
+        poly = me.polygons[0]
+        pts = [mat @ me.vertices[vi].co for vi in poly.vertices]
+        if len(pts) < 3:
+            self.report({'ERROR'}, "Floor Map has no valid outline")
+            return {'CANCELLED'}
+        new_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in pts])
+        target.bound_json = new_json
+        target.lock = True
+        # the floor's already-seeded room (Generate Floor Map auto-seeds one)
+        # holds its OWN separate copy of the polygon -- update it too, or
+        # the next split reads the stale pre-correction shape and the fix
+        # is lost the moment you start cutting rooms
+        updated_rooms = 0
+        for r in s.rooms:
+            if r.floor_index == s.floor_index:
+                r.poly_json = new_json
+                updated_rooms += 1
+        self.report({'INFO'},
+            f"Floor {s.floor_index + 1}'s map saved as final"
+            + (f" ({updated_rooms} room outline synced)" if updated_rooms else ""))
         return {'FINISHED'}
 
 
@@ -1393,7 +2000,7 @@ class GN_OT_clear(Operator):
     bl_idname = "gn_int.clear"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clear Generated"
-    bl_description = "Delete generated boundaries and interior shells"
+    bl_description = "Delete generated floor maps and interior shells"
 
     def execute(self, context):
         _clear_coll(BOUND_COLL)
@@ -1407,7 +2014,7 @@ class GN_OT_clean_interior(Operator):
     bl_label = "Clean Interior Tool (New Building)"
     bl_description = ("Reset for a different building: clears the exterior "
                       "reference, floors, rooms, openings, stairs, generated "
-                      "boundaries, and the MLO name fields. Does NOT touch any "
+                      "floor maps, and the MLO name fields. Does NOT touch any "
                       "MLO collections already built (int_<name> etc) -- use "
                       "Clean MLO for that first if you want those gone too")
 
@@ -1421,8 +2028,8 @@ class GN_OT_clean_interior(Operator):
         s.rooms.clear()
         s.openings.clear()
         s.mlo_name = ""
-        s.timecycle_name = ""
-        s.timecycle_auto = True
+        s.timecycle_name = "int_gasstation"
+        s.timecycle_auto = False
         _clear_coll(BOUND_COLL)
         _clear_coll(ROOM_COLL)
         _clear_coll(DOORFRAME_COLL)
@@ -1436,59 +2043,108 @@ class GN_OT_clean_interior(Operator):
 
 
 # ---- mesh builders --------------------------------------------------------
-def _make_loop_object(coll, name, poly_xy, z):
+def _make_face_object(coll, name, poly_xy, z):
+    """Build the Floor Map as a single flat n-gon FACE (no triangulation) --
+    this is the thing you slice directly to make rooms, not a wire outline."""
     bm = bmesh.new()
     vs = [bm.verts.new((p.x, p.y, z)) for p in poly_xy]
-    for i in range(len(vs)):
-        try:
-            bm.edges.new((vs[i], vs[(i + 1) % len(vs)]))
-        except ValueError:
-            pass
+    try:
+        bm.faces.new(vs)
+    except ValueError:
+        pass
+    bm.normal_update()
     me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     bm.free()
     ob = bpy.data.objects.new(name, me)
     coll.objects.link(ob)
     ob.show_in_front = True
-    ob.display_type = 'WIRE'
     return ob
 
 
-def _ordered_loop_xy(ob):
-    """Walk ob's edge loop in order -> world-space XY polygon [(x,y),...]."""
-    me = ob.data
-    if len(me.vertices) < 3:
-        return None
-    adj = {}
-    for e in me.edges:
-        a, b = e.vertices[0], e.vertices[1]
-        adj.setdefault(a, []).append(b)
-        adj.setdefault(b, []).append(a)
-    if not adj:
-        return None
-    start = next(iter(adj))
-    order = [start]
-    prev = None
-    cur = start
-    while True:
-        nxts = [v for v in adj.get(cur, []) if v != prev]
-        if not nxts:
-            break
-        nxt = nxts[0]
-        if nxt == start:
-            break
-        order.append(nxt)
-        prev, cur = cur, nxt
-        if len(order) > len(me.vertices):
-            break
-    mat = ob.matrix_world
-    return [((mat @ me.vertices[i].co).x, (mat @ me.vertices[i].co).y) for i in order]
+def _face_centroid_xy(face, mat):
+    pts = [mat @ v.co for v in face.verts]
+    n = len(pts)
+    return sum(p.x for p in pts) / n, sum(p.y for p in pts) / n
+
+
+def _poly_centroid_xy(poly_xy):
+    n = len(poly_xy)
+    return sum(p[0] for p in poly_xy) / n, sum(p[1] for p in poly_xy) / n
+
+
+def _replace_floor_map_face(floor, old_poly_xy, new_polys_xy):
+    """On the Floor Map object for `floor`, find the face matching
+    old_poly_xy (by centroid, the closest match) and replace it with one new
+    face per polygon in new_polys_xy. Returns True on success."""
+    fm_ob = _boundary_object_for_floor(floor)
+    if fm_ob is None:
+        return False
+    bm = bmesh.new()
+    bm.from_mesh(fm_ob.data)
+    bm.faces.ensure_lookup_table()
+    if not bm.faces:
+        bm.free()
+        return False
+    mat = fm_ob.matrix_world
+    inv = mat.inverted()
+    tx, ty = _poly_centroid_xy(old_poly_xy)
+    target, best_d = None, 1e18
+    for f in bm.faces:
+        fx, fy = _face_centroid_xy(f, mat)
+        d = (fx - tx) ** 2 + (fy - ty) ** 2
+        if d < best_d:
+            best_d = d
+            target = f
+    if target is None:
+        bm.free()
+        return False
+    face_z = (mat @ target.verts[0].co).z
+    bmesh.ops.delete(bm, geom=[target], context='FACES')
+    for poly in new_polys_xy:
+        vs = [bm.verts.new(inv @ Vector((p.x, p.y, face_z))) for p in poly]
+        try:
+            bm.faces.new(vs)
+        except ValueError:
+            pass
+    bm.normal_update()
+    bm.to_mesh(fm_ob.data)
+    fm_ob.data.update()
+    bm.free()
+    return True
+
+
+def _reset_floor_map_face(floor, poly_xy):
+    """Wipe every face on the Floor Map for `floor` and replace it with a
+    single face matching poly_xy -- used by Reset Room Outline to drop any
+    room-splitting cuts and go back to the whole-floor envelope."""
+    fm_ob = _boundary_object_for_floor(floor)
+    if fm_ob is None:
+        return False
+    bm = bmesh.new()
+    bm.from_mesh(fm_ob.data)
+    if bm.verts:
+        bmesh.ops.delete(bm, geom=list(bm.verts), context='VERTS')
+    vs = [bm.verts.new((p[0], p[1], floor.z)) for p in poly_xy]
+    try:
+        bm.faces.new(vs)
+    except ValueError:
+        pass
+    bm.normal_update()
+    bm.to_mesh(fm_ob.data)
+    fm_ob.data.update()
+    bm.free()
+    return True
 
 
 def _boundary_object_for_floor(floor, tol=0.05):
-    """Find the GN_Bound_Floor* object for this floor, matched by Z (not name)
-    so it's correct even if floors were added out of Z order."""
-    coll = bpy.data.collections.get(BOUND_COLL)
+    """Find the GN_FloorMap_Floor* object for this floor, matched by Z (not
+    name) so it's correct even if floors were added out of Z order. Checks
+    the pre-rename 'GN_Boundaries' collection too -- if the migration timer
+    (_deferred_restore) hasn't run yet on a scene from before the Floor Map
+    rename, we must still find the object instead of concluding every
+    floor's boundary was deleted and wiping the Floors list."""
+    coll = bpy.data.collections.get(BOUND_COLL) or bpy.data.collections.get("GN_Boundaries")
     if not coll:
         return None
     best_ob = None
@@ -1505,21 +2161,54 @@ def _boundary_object_for_floor(floor, tol=0.05):
     return best_ob if best_ob is not None and best_dz < tol else None
 
 
-def _read_boundary_poly(floor):
-    """Read the CURRENT boundary mesh for this floor (picks up hand edits made
-    in Edit Mode, which never touch floor.bound_json). Falls back to the
-    stored bound_json if no live boundary object is found."""
-    best_ob = _boundary_object_for_floor(floor)
-    if best_ob is not None:
-        poly = _ordered_loop_xy(best_ob)
-        if poly and len(poly) >= 3:
-            return poly
-    if floor.bound_json:
+def _sync_floors_with_boundaries(scene):
+    """Drop any floor whose previously-generated boundary object was deleted
+    by hand (e.g. in the Outliner) -- otherwise the Floors list keeps showing
+    an entry with nothing left backing it. Floors that never had a boundary
+    generated yet (no bound_json) are untouched. Takes a Scene (not a
+    Context) so it's safe to call from a depsgraph handler, where context is
+    not fully valid."""
+    if not hasattr(scene, "gn_int"):
+        return
+    s = scene.gn_int
+    stale = [i for i, f in enumerate(s.floors)
+             if f.bound_json and _boundary_object_for_floor(f) is None]
+    for i in reversed(stale):
+        s.floors.remove(i)
+    if stale and s.floor_index >= len(s.floors):
+        s.floor_index = len(s.floors) - 1
+
+
+@bpy.app.handlers.persistent
+def _gn_depsgraph_sync(scene, depsgraph=None):
+    # Panel.draw() is the wrong place to mutate scene data -- collection
+    # edits made there can silently no-op depending on context, which is
+    # exactly why the Floors list kept showing a deleted boundary's floor.
+    # React to the real scene-graph change instead -- but depsgraph_update_post
+    # fires during undo/redo too, and mutating bpy.data synchronously from
+    # inside it (this handler used to call s.floors.remove() directly) can
+    # crash Blender. Defer the actual mutation to the next event-loop tick,
+    # same reentrancy-safe pattern as every other callback in this file.
+    scene_name = scene.name
+
+    def _do():
+        sc = bpy.data.scenes.get(scene_name)
+        if sc is None:
+            return None
         try:
-            return [tuple(p) for p in json.loads(floor.bound_json)]
+            _sync_floors_with_boundaries(sc)
         except Exception:
             pass
-    return None
+        try:
+            _sync_lists_from_active(sc)      # msgbus misses some selections
+        except Exception:
+            pass
+        return None
+
+    try:
+        bpy.app.timers.register(_do, first_interval=0.0)
+    except Exception:
+        pass
 
 
 # surface material slots (index order used by _build_wall / _build_shell)
@@ -1807,11 +2496,23 @@ def rebuild_rooms(context):
             if fl:
                 base, top, _ = fl
                 r.z_offset = prev[r.uid][3] - (base + top) * 0.5
-    _clear_coll(ROOM_COLL)
+    locked_obs = {}
+    if coll:
+        for ob in coll.objects:
+            u = ob.get("gn_room_uid")
+            r = next((r for r in s.rooms if r.uid == u), None)
+            if r is not None and r.lock:
+                locked_obs[u] = ob
+    for ob in list(coll.objects) if coll else []:
+        u = ob.get("gn_room_uid")
+        if u not in locked_obs:
+            bpy.data.objects.remove(ob, do_unlink=True)
     coll = _get_coll(ROOM_COLL)
     for i, r in enumerate(s.rooms):
         if not r.uid:
             r.uid = _new_uid(s)
+        if r.uid in locked_obs:
+            continue    # keep the hand-edited mesh exactly as-is
         fl = _floor_by_index(context, r.floor_index)
         if not fl:
             continue
@@ -1998,12 +2699,15 @@ def split_polygon_path(poly, path, gap):
 
 def split_room_record_path(context, room_idx, path):
     """Split room[room_idx] by an open polyline (bend cut) with the
-    partition gap. Returns count made (0 or 2)."""
+    partition gap -- cutting the Floor Map's own face into two new faces.
+    Returns count made (0 or 2)."""
     s = context.scene.gn_int
     if not (0 <= room_idx < len(s.rooms)):
         return 0
     rec = s.rooms[room_idx]
     fidx = rec.floor_index
+    if not (0 <= fidx < len(s.floors)):
+        return 0
     try:
         poly = [Vector(p) for p in json.loads(rec.poly_json)]
     except Exception:
@@ -2011,27 +2715,45 @@ def split_room_record_path(context, room_idx, path):
     a, b = split_polygon_path(poly, path, s.partition)
     if not a or not b:
         return 0
+    if not _replace_floor_map_face(s.floors[fidx], poly, [a, b]):
+        return 0
     s.rooms.remove(room_idx)
     for part in (a, b):
         r = s.rooms.add()
         r.floor_index = fidx
         r.uid = _new_uid(s)
         r.poly_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in part])
-    rebuild_rooms(context)
+    _dump_scene(context.scene)
     return 2
 
 
-def seed_rooms_from_boundaries(context, floor_idx=None):
-    """Make one room = the SELECTED floor's whole boundary polygon (all floors
-    if floor_idx is None). Rooms on OTHER floors -- including any splits
-    already made there -- are left completely untouched.
+def seed_rooms_from_boundaries(context, floor_idxs=None):
+    """Reset every floor in floor_idxs (all floors if None; a single int also
+    accepted) back to ONE room = its Floor Map's whole envelope -- wiping any
+    room-splitting cuts made on that floor's Floor Map face and starting
+    over. Rooms on OTHER floors are left completely untouched. Does NOT
+    build any 3D walls -- any walls already built for a replaced room are
+    deleted so the floor drops back to a flat, outline-only state
+    immediately; run Build Walls when ready to turn the outline into real
+    geometry.
 
-    Reads the LIVE boundary mesh (picks up hand edits) rather than the
-    bound_json snapshot from when Generate Boundaries last ran.
-    Returns the number of floors seeded.
+    Uses the pristine bound_json snapshot from when Generate Floor Map last
+    ran (not the live Floor Map mesh, which may currently be split into
+    several room faces). Returns the number of floors seeded.
     """
     s = context.scene.gn_int
-    targets = {floor_idx} if floor_idx is not None else set(range(len(s.floors)))
+    if floor_idxs is None:
+        targets = set(range(len(s.floors)))
+    elif isinstance(floor_idxs, int):
+        targets = {floor_idxs}
+    else:
+        targets = set(floor_idxs)
+    dropped_uids = {r.uid for r in s.rooms if r.floor_index in targets}
+    room_coll = bpy.data.collections.get(ROOM_COLL)
+    if room_coll:
+        for ob in list(room_coll.objects):
+            if ob.get("gn_room_uid") in dropped_uids:
+                bpy.data.objects.remove(ob, do_unlink=True)
     keep = [(r.floor_index, r.poly_json, r.uid) for r in s.rooms
             if r.floor_index not in targets]
     s.rooms.clear()
@@ -2045,26 +2767,33 @@ def seed_rooms_from_boundaries(context, floor_idx=None):
         if not (0 <= i < len(s.floors)):
             continue
         f = s.floors[i]
-        poly = _read_boundary_poly(f)
-        if not poly:
+        if not f.bound_json:
+            continue
+        try:
+            poly = json.loads(f.bound_json)
+        except Exception:
+            continue
+        if len(poly) < 3 or not _reset_floor_map_face(f, poly):
             continue
         rec = s.rooms.add()
         rec.floor_index = i
         rec.uid = _new_uid(s)
-        rec.poly_json = json.dumps([[round(p[0], 4), round(p[1], 4)] for p in poly])
-        f.bound_json = rec.poly_json   # keep the snapshot in sync with the edit
+        rec.poly_json = json.dumps(poly)
         made += 1
-    rebuild_rooms(context)
+    _dump_scene(context.scene)
     return made
 
 
 def split_room_record(context, room_idx, A, B):
-    """Split room[room_idx] by line A-B with the partition gap. Returns count made."""
+    """Split room[room_idx] by line A-B with the partition gap -- cutting
+    the Floor Map's own face into two new faces. Returns count made."""
     s = context.scene.gn_int
     if not (0 <= room_idx < len(s.rooms)):
         return 0
     rec = s.rooms[room_idx]
     fidx = rec.floor_index
+    if not (0 <= fidx < len(s.floors)):
+        return 0
     try:
         poly = [Vector(p) for p in json.loads(rec.poly_json)]
     except Exception:
@@ -2072,13 +2801,15 @@ def split_room_record(context, room_idx, A, B):
     pos, neg = split_polygon(poly, A, B, s.partition)
     if not pos or not neg:
         return 0
+    if not _replace_floor_map_face(s.floors[fidx], poly, [pos, neg]):
+        return 0
     s.rooms.remove(room_idx)
     for part in (pos, neg):
         r = s.rooms.add()
         r.floor_index = fidx
         r.uid = _new_uid(s)
         r.poly_json = json.dumps([[round(p.x, 4), round(p.y, 4)] for p in part])
-    rebuild_rooms(context)
+    _dump_scene(context.scene)
     return 2
 
 
@@ -2095,6 +2826,52 @@ def _room_at_point(context, floor_idx, pt):
         if _pt_in_poly(pt, poly):
             return i
     return -1
+
+
+def _room_for_opening(context, op):
+    """(floor_idx, room_idx) this opening belongs to, or (floor_idx, None) /
+    (None, None) if unmatched. An opening's (cx, cy) sits ON the wall plane,
+    which a plain point-in-polygon test against the room's interior treats
+    as ambiguous/outside -- so after trying the raw point, nudge it inward
+    along the opening's own normal (trying both directions, since sign
+    convention isn't guaranteed) by increasing amounts until it lands inside
+    a room."""
+    fi = _floor_idx_for_z(context, op.sill)
+    if fi is None:
+        return None, None
+    base = Vector((op.cx, op.cy))
+    ri = _room_at_point(context, fi, base)
+    if ri is not None and ri >= 0:
+        return fi, ri
+    nrm = Vector((op.nx, op.ny))
+    if nrm.length > 1e-6:
+        nrm = nrm.normalized()
+        for eps in (0.15, 0.3, 0.6, 1.0):
+            for sign in (1, -1):
+                ri = _room_at_point(context, fi, base + nrm * eps * sign)
+                if ri is not None and ri >= 0:
+                    return fi, ri
+    return fi, None
+
+
+def _group_openings_by_room(context):
+    """Group opening indices by (floor_index, room_index) via _room_for_opening.
+    Returns an ordered list of ((floor_idx_or_None, room_idx_or_None),
+    [opening_index, ...]); openings that don't land in any known floor/room
+    are grouped last under (None, None). room_idx matches GN_UL_rooms's own
+    numbering (global position in s.rooms + 1), so the two panels
+    cross-reference cleanly."""
+    s = context.scene.gn_int
+    groups = {}
+    for i, op in enumerate(s.openings):
+        key = _room_for_opening(context, op)
+        groups.setdefault(key, []).append(i)
+
+    def sort_key(k):
+        fi, ri = k
+        return (fi is None, fi if fi is not None else 0, ri is None, ri if ri is not None else 0)
+
+    return [(k, groups[k]) for k in sorted(groups, key=sort_key)]
 
 
 def _plane_hit(context, event, z):
@@ -2129,13 +2906,13 @@ class GN_OT_draw_room(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Draw Room"
     bl_description = ("Click two opposite corners on the active floor to create a "
-                      "rectangular room (clamped to the boundary)")
+                      "rectangular room (clamped to the floor map)")
 
     def invoke(self, context, event):
         s = context.scene.gn_int
         fl = _floor_by_index(context, s.active_floor)
         if not fl or fl[2] is None:
-            self.report({'ERROR'}, "Generate boundaries first (need a floor boundary)")
+            self.report({'ERROR'}, "Generate a floor map first (need a floor map)")
             return {'CANCELLED'}
         self.base_z = fl[0]
         self.bound = fl[2]
@@ -2205,7 +2982,7 @@ class GN_OT_add_room(Operator):
         s = context.scene.gn_int
         fl = _floor_by_index(context, s.active_floor)
         if not fl or fl[2] is None:
-            self.report({'ERROR'}, "Generate boundaries first")
+            self.report({'ERROR'}, "Generate a floor map first")
             return {'CANCELLED'}
         bnd = fl[2]
         xs = [p.x for p in bnd]
@@ -2239,8 +3016,10 @@ class GN_OT_remove_room(Operator):
 class GN_OT_rebuild_rooms(Operator):
     bl_idname = "gn_int.rebuild_rooms"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Rebuild Rooms"
-    bl_description = "Rebuild all room shells from stored footprints"
+    bl_label = "Build Walls"
+    bl_description = ("Turn the current room outline(s) into real 3D walls. "
+                      "Safe to re-run any time to pick up outline edits -- "
+                      "never touches the Floor Map or the outlines themselves")
 
     def execute(self, context):
         rebuild_rooms(context)
@@ -2359,6 +3138,20 @@ def _mlo_room_token_from_shell_name(shell_name, mlo_name):
     return m.group(1) if m else None
 
 
+def _mlo_purge_collection_objects(col):
+    """Delete every object in col and its sub-collections (data-blocks too,
+    via do_unlink), recursively. Used for Clean MLO's Collisions/Portals
+    wipe -- those are pure Build MLO output with no prior state to restore
+    to, so a full delete IS the correct undo. Returns count deleted."""
+    n = 0
+    for ob in list(col.objects):
+        bpy.data.objects.remove(ob, do_unlink=True)
+        n += 1
+    for child in list(col.children):
+        n += _mlo_purge_collection_objects(child)
+    return n
+
+
 def _mlo_delete_empty_tree(col):
     """Delete col and its sub-collections, but ONLY where genuinely empty (no
     objects, and every child was itself removable). A collection still holding
@@ -2385,11 +3178,15 @@ class GN_OT_clean_mlo(Operator):
     bl_idname = "gn_int.clean_mlo"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clean MLO"
-    bl_description = ("Undo the MLO build: move each room shell mesh in Main "
-                      "back into GN_Rooms under its original name, delete the "
-                      "shell empty, then remove the int_<name> collection "
-                      "scaffolding. Any collection still holding real content "
-                      "(props/assets you placed) is left in place, not deleted")
+    bl_description = ("Undo the MLO build entirely, back to before Build MLO "
+                      "ran: move each room shell mesh in Main back into "
+                      "GN_Rooms under its original name, delete the shell "
+                      "empty, delete every generated collision object and "
+                      "portal (Collisions/Portals have no pre-MLO state to "
+                      "restore to -- Build MLO creates them from scratch), "
+                      "then remove the int_<name> collection scaffolding. Any "
+                      "OTHER collection still holding real content (props/ "
+                      "assets you placed by hand) is left in place")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -2402,6 +3199,15 @@ class GN_OT_clean_mlo(Operator):
         if main_col is None:
             self.report({'INFO'}, f"'{col_name}' doesn't exist - nothing to clean")
             return {'CANCELLED'}
+
+        # Collisions and Portals are ENTIRELY generated by Build MLO (no
+        # pre-existing content to restore elsewhere, unlike room shells) --
+        # purge every object in them so the empty-tree cleanup below can
+        # remove the collections themselves too
+        purged = 0
+        for child in main_col.children:
+            if child.name in ("Collisions", "Portals"):
+                purged += _mlo_purge_collection_objects(child)
 
         main_room = None
         for child in main_col.children:
@@ -2433,8 +3239,19 @@ class GN_OT_clean_mlo(Operator):
                 room_coll.objects.link(ob)
                 restored += 1
 
+        # empties Build MLO's own "Add Empties" step created (decals/details/
+        # proxy/visuals/lights/custom, in each room's collection) are ALSO
+        # pure Build MLO output with nothing to restore to -- delete them too,
+        # but only EMPTY-type objects, so hand-placed prop/asset MESHES are
+        # never touched
+        for ob in list(main_col.all_objects):
+            if ob.type == 'EMPTY':
+                bpy.data.objects.remove(ob, do_unlink=True)
+                purged += 1
+
         kept, col_count = _mlo_delete_empty_tree(main_col)
-        msg = f"Restored {restored} room(s) to GN_Rooms, removed {col_count} empty collection(s)"
+        msg = (f"Restored {restored} room(s) to GN_Rooms, deleted {purged} "
+              f"collision/portal object(s), removed {col_count} empty collection(s)")
         if kept:
             msg += f" - kept (not empty): {', '.join(kept)}"
         self.report({'INFO'}, msg)
@@ -2461,11 +3278,11 @@ class GN_OT_build_mlo(Operator):
         sub.enabled = s.build_room_colls
         sub.prop(s, "build_prop_colls")
         sub.prop(s, "build_asset_colls")
+        col.prop(s, "build_empties")
         self.layout.separator()
         col2 = self.layout.column(align=True)
         col2.prop(s, "build_shell_collision")
         col2.prop(s, "build_portals")
-        col2.prop(s, "build_empties")
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -2477,7 +3294,7 @@ class GN_OT_build_mlo(Operator):
                       or s.build_prop_colls or s.build_asset_colls)
         room_coll = bpy.data.collections.get(ROOM_COLL)
         if needs_rooms and (not room_coll or not room_coll.objects):
-            self.report({'ERROR'}, "No built rooms - run Make Floor Walls first")
+            self.report({'ERROR'}, "No built rooms - run Build Walls first")
             return {'CANCELLED'}
 
         main_col = _mlo_ensure_scene_collection(f"int_{name}", context.scene)
@@ -2517,6 +3334,7 @@ class GN_OT_build_mlo(Operator):
             for col in list(empty.users_collection):
                 if col is not main_room:
                     col.objects.unlink(empty)
+            _mlo_apply_empty_defaults(empty, mlo_name=name)
 
         # each built room: optionally get an r0N collection (+ Props_/Assets_
         # subfolders), and optionally have its shell mesh renamed and moved
@@ -2535,7 +3353,7 @@ class GN_OT_build_mlo(Operator):
                     _mlo_make_collection(f"Props_{room_token}", rcol)
                 if s.build_asset_colls:
                     try:
-                        _mlo_make_collection(f"Assets_{room_token}", rcol).ragequit_type = 'none'
+                        _mlo_make_collection(f"Assets_{room_token}", rcol).ragequit_type = 'assets'
                     except Exception:
                         pass
 
@@ -2567,6 +3385,11 @@ class GN_OT_build_mlo(Operator):
             ob.parent = empty
             ob.matrix_parent_inverse = Matrix.Identity(4)
             ob.matrix_world = world_mat
+            try:
+                from Sollumz.sollumz_properties import SollumType
+                ob.sollum_type = SollumType.DRAWABLE_MODEL
+            except Exception:
+                pass
             moved += 1
 
         _mlo_apply_collection_types(main_col)
@@ -2576,33 +3399,17 @@ class GN_OT_build_mlo(Operator):
             if replaced:
                 msg += f" ({replaced} replaced)"
 
-        if s.build_shell_collision:
-            try:
-                from Sollumz.ybn.collision_materials import collisionmats as coll_mats
-            except ImportError:
-                coll_mats = None
-            shell_empty, room_meshes = _find_mlo_shell_data(name)
-            mat_mapping = {}
-            if shell_empty is not None:
-                seen = set()
-                for meshes in room_meshes.values():
-                    for o in meshes:
-                        for mat in o.data.materials:
-                            if mat and mat.name not in seen:
-                                seen.add(mat.name)
-                                idx = _guess_collision_material_index(mat.name)
-                                if idx > 0:
-                                    mat_mapping[mat.name] = idx
-            created, err = _do_build_shell_collision(context, name, mat_mapping)
-            if err:
-                msg += f", collision SKIPPED ({err})"
-            else:
-                msg += f", collision for {created} room(s)"
-
         if s.build_portals:
             try:
-                bpy.ops.gn_int.create_portals()
-                msg += ", portals"
+                result = bpy.ops.gn_int.create_portals()
+                if 'FINISHED' in result:
+                    msg += ", portals"
+                else:
+                    # create_portals() reports its own specific error (e.g. no
+                    # openings), but returning {'CANCELLED'} raises no
+                    # exception -- checking only for an exception here used to
+                    # let this silently claim "portals" even when 0 were made
+                    msg += ", portals SKIPPED (see previous error)"
             except Exception as e:
                 msg += f", portals SKIPPED ({e})"
 
@@ -2624,6 +3431,13 @@ class GN_OT_build_mlo(Operator):
             msg += f", {n_empties} empt(y/ies)"
 
         self.report({'INFO'}, msg)
+        if s.build_shell_collision:
+            # Same interactive material-mapping dialog as the standalone
+            # "Create Shell Collision" tool (auto-guesses each material as a
+            # starting suggestion, but always lets you review/override before
+            # anything is actually built) -- chained right after this dialog
+            # closes, rather than silently auto-assigning materials here.
+            bpy.ops.gn_int.create_shell_collision('INVOKE_DEFAULT')
         return {'FINISHED'}
 
 
@@ -2677,7 +3491,10 @@ class GN_OT_add_prop_collections(Operator):
             self.report({'ERROR'}, "No room collections found - run Add Room Collections first")
             return {'CANCELLED'}
         for rcol in rooms:
-            _mlo_make_collection(f"Props_{rcol.name}", rcol)
+            try:
+                _mlo_make_collection(f"Props_{rcol.name}", rcol).ragequit_type = 'room_props'
+            except Exception:
+                pass
         self.report({'INFO'}, f"Props_ sub-collection ready for {len(rooms)} room(s)")
         return {'FINISHED'}
 
@@ -2695,7 +3512,7 @@ class GN_OT_add_asset_collections(Operator):
             return {'CANCELLED'}
         for rcol in rooms:
             try:
-                _mlo_make_collection(f"Assets_{rcol.name}", rcol).ragequit_type = 'none'
+                _mlo_make_collection(f"Assets_{rcol.name}", rcol).ragequit_type = 'assets'
             except Exception:
                 pass
         self.report({'INFO'}, f"Assets_ sub-collection ready for {len(rooms)} room(s)")
@@ -3027,7 +3844,7 @@ def _do_build_shell_collision(context, name, mat_mapping):
 # already knows each opening's position and can look up which room(s) it
 # borders, where scene_organizer needs the user to pick rooms by hand.
 # ===========================================================================
-def _mlo_apply_archetype_defaults(obj, set_static=False):
+def _mlo_apply_archetype_defaults(obj, set_static=False, mlo_name=None):
     try:
         arch = obj.ragequit_archetype
         arch.lodDist = 200
@@ -3434,14 +4251,23 @@ _PRESET_ATTR = {"decals": "empty_decals", "details": "empty_details",
                 "lights": "empty_lights"}
 
 
-def _mlo_apply_empty_defaults(empty):
+def _mlo_apply_empty_defaults(empty, mlo_name=None, no_shadows=False):
     try:
         from Sollumz.sollumz_properties import SollumType
         empty.sollum_type = SollumType.DRAWABLE
     except Exception:
         pass
-    _mlo_apply_archetype_defaults(empty, set_static=True)
+    _mlo_apply_archetype_defaults(empty, set_static=True, mlo_name=mlo_name)
     _mlo_apply_sollumz_lod_defaults(empty)
+    if no_shadows:
+        # decals/proxy/visuals empties shouldn't cast shadows in-game --
+        # details/lights/custom keep Sollumz's own default (shadows on)
+        try:
+            ent = empty.ragequit_entity
+            ent.flag_cast_static_shadows = False
+            ent.flag_cast_dynamic_shadows = False
+        except Exception:
+            pass
 
 
 def _gn_create_empty_in_room(room_col, mlo_name, room_name, empty_type_name):
@@ -3466,7 +4292,8 @@ def _gn_create_empty_in_room(room_col, mlo_name, room_name, empty_type_name):
     empty.empty_display_type = 'PLAIN_AXES'
     empty.location = pivot
     room_col.objects.link(empty)
-    _mlo_apply_empty_defaults(empty)
+    _mlo_apply_empty_defaults(empty, mlo_name=mlo_name,
+                              no_shadows=empty_type_name in ('decals', 'proxy', 'visuals'))
     return empty
 
 
@@ -3562,6 +4389,34 @@ class GN_OT_remove_custom_empty(Operator):
 # (Blender auto-dedups .001, .002...), optionally applying modifiers/scale,
 # renaming the UV map to "UVMap 0", and joining into one object.
 # ===========================================================================
+def _gn_organise_renamed(context, obj, mlo_name, room, room_num, category):
+    """Move a freshly-renamed <mlo>_<room_num>_<category> object into its
+    room collection and parent it to the matching category empty (keeping
+    world transform), same as scene_organizer.py's own Organise step that
+    Smart Rename always runs afterward -- otherwise the renamed object is
+    left wherever it happened to already be (often the scene root), not
+    actually organised into the room hierarchy at all."""
+    room_col = bpy.data.collections.get(room)
+    if room_col is not None:
+        for col in list(obj.users_collection):
+            col.objects.unlink(obj)
+        room_col.objects.link(obj)
+    try:
+        from Sollumz.sollumz_properties import SollumType
+        obj.sollum_type = SollumType.DRAWABLE_MODEL
+    except Exception:
+        pass
+    _mlo_apply_archetype_defaults(obj, set_static=True)
+    _mlo_apply_sollumz_lod_defaults(obj)
+    empty = bpy.data.objects.get(f"{mlo_name}_{room_num}_{category}")
+    if empty is not None:
+        world_mat = obj.matrix_world.copy()
+        obj.parent = empty
+        obj.matrix_parent_inverse = Matrix.Identity(4)
+        obj.matrix_world = world_mat
+    return room_col is not None, empty is not None
+
+
 class GN_OT_smart_rename(Operator):
     bl_idname = "gn_int.smart_rename"
     bl_options = {'REGISTER', 'UNDO'}
@@ -3606,7 +4461,11 @@ class GN_OT_smart_rename(Operator):
             self.report({'WARNING'}, "No mesh objects selected")
             return {'CANCELLED'}
 
-        base = f"{name}_{room}_{category}"
+        # room_num (not the raw "r01" collection name) so this matches Add
+        # Empties' own naming exactly (<mlo>_<room_num>_<category>) -- that's
+        # what lets the object below find and parent to its category empty
+        room_num = _gn_room_number_from_name(room)
+        base = f"{name}_{room_num}_{category}"
         for i, obj in enumerate(objects):
             obj.name = f"__gn_tmp_{i:04d}__"
         for obj in objects:
@@ -3650,13 +4509,28 @@ class GN_OT_smart_rename(Operator):
                             active_object=target, object=target):
                         bpy.ops.object.join()
                     target.name = base
-                    self.report({'INFO'},
-                                f"Renamed and merged {len(all_matching)} object(s) -> '{base}'")
+                    moved, parented = _gn_organise_renamed(context, target, name, room, room_num, category)
+                    msg = f"Renamed and merged {len(all_matching)} object(s) -> '{base}'"
+                    if not moved:
+                        msg += f" (room collection '{room}' not found)"
+                    elif not parented:
+                        msg += f" (no '{base}' empty to parent to)"
+                    self.report({'INFO'}, msg)
                     return {'FINISHED'}
                 except RuntimeError as e:
                     self.report({'WARNING'}, f"Join failed: {e}")
 
-        self.report({'INFO'}, f"Renamed {len(objects)} object(s) -> '{base}'")
+        moved_n = parented_n = 0
+        for obj in objects:
+            moved, parented = _gn_organise_renamed(context, obj, name, room, room_num, category)
+            moved_n += moved
+            parented_n += parented
+        msg = f"Renamed {len(objects)} object(s) -> '{base}'"
+        if moved_n < len(objects):
+            msg += f" (room collection '{room}' not found)"
+        elif parented_n < len(objects):
+            msg += f" (no '{base}' empty to parent to)"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -3742,7 +4616,7 @@ class GN_OT_create_asset(Operator):
         root_obj.sollum_type = SollumType.DRAWABLE
         root_obj.matrix_world = IDENT.copy()
         dest_col.objects.link(root_obj)
-        _mlo_apply_archetype_defaults(root_obj, set_static=True)
+        _mlo_apply_archetype_defaults(root_obj, set_static=True, mlo_name=name)
         _mlo_apply_sollumz_lod_defaults(root_obj)
 
         col_name = f"{base}.col"
@@ -3830,7 +4704,7 @@ class GN_OT_create_asset(Operator):
         obj.parent = root_obj
         obj.matrix_parent_inverse = IDENT.copy()
         obj.matrix_world = IDENT.copy()
-        _mlo_apply_archetype_defaults(obj, set_static=True)
+        _mlo_apply_archetype_defaults(obj, set_static=True, mlo_name=name)
         _mlo_apply_sollumz_lod_defaults(obj)
 
         def _strip_dedup(n):
@@ -3867,34 +4741,48 @@ class GN_OT_clear_rooms(Operator):
     bl_idname = "gn_int.clear_rooms"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Clear Rooms"
+    bl_description = ("Reset every floor's Floor Map back to one whole-floor "
+                      "room, dropping all room-splitting cuts, and delete any "
+                      "built walls")
 
     def execute(self, context):
-        context.scene.gn_int.rooms.clear()
-        _clear_coll(ROOM_COLL)
+        seed_rooms_from_boundaries(context, None)
         return {'FINISHED'}
 
 
 class GN_OT_seed_rooms(Operator):
     bl_idname = "gn_int.seed_rooms"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Make Floor Walls"
-    bl_description = ("Reset the SELECTED floor to one room = its whole envelope, "
-                      "ready to split. Other floors (and any splits already made "
-                      "there) are left untouched")
+    bl_label = "Reset Room Outline"
+    bl_description = ("Undo all room-splitting cuts on every SELECTED floor "
+                      "(its Floor Map object and/or rooms selected in the "
+                      "viewport -- shift-click to pick several), going back "
+                      "to one room = its whole Floor Map. NOT needed for a "
+                      "new floor -- Generate Floor Map already leaves you "
+                      "with one splittable room. Any walls already built for "
+                      "that floor are removed. Falls back to the floor "
+                      "list's active floor if nothing relevant is selected. "
+                      "Other floors (and any splits already made there) are "
+                      "left untouched")
 
     def execute(self, context):
         s = context.scene.gn_int
         if not s.floors:
-            self.report({'ERROR'}, "Generate boundaries first")
+            self.report({'ERROR'}, "Generate a floor map first")
             return {'CANCELLED'}
-        if not (0 <= s.floor_index < len(s.floors)):
-            self.report({'ERROR'}, "Select a floor in the list")
-            return {'CANCELLED'}
-        made = seed_rooms_from_boundaries(context, s.floor_index)
+        idxs = {i for ob in context.selected_objects
+               if (i := _floor_index_for_object(ob, s)) is not None}
+        if not idxs:
+            if not (0 <= s.floor_index < len(s.floors)):
+                self.report({'ERROR'}, "Select a floor in the list")
+                return {'CANCELLED'}
+            idxs = {s.floor_index}
+        made = seed_rooms_from_boundaries(context, idxs)
         if made == 0:
-            self.report({'WARNING'}, "No boundary for this floor - run Generate Boundaries")
+            self.report({'WARNING'}, "No floor map for the selected floor(s) - run Generate Floor Map")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Floor {s.floor_index+1} reset to its envelope")
+        names = ", ".join(str(i + 1) for i in sorted(idxs))
+        self.report({'INFO'}, f"Floor{'s' if len(idxs) != 1 else ''} {names} room outline reset ({made} seeded) - Build Walls when ready")
         return {'FINISHED'}
 
 
@@ -3927,7 +4815,7 @@ class GN_OT_split_room(Operator):
             self.report({'ERROR'}, "No active floor")
             return {'CANCELLED'}
         if not any(r.floor_index == s.active_floor for r in s.rooms):
-            self.report({'ERROR'}, "No rooms on this floor - click 'Rooms = Envelope' first")
+            self.report({'ERROR'}, "No room outline on this floor - click 'Reset Room Outline' first")
             return {'CANCELLED'}
         self.base_z = fl[0]
         self.p0 = None
@@ -4013,13 +4901,21 @@ class GN_OT_split_room_path(Operator):
 
     def invoke(self, context, event):
         s = context.scene.gn_int
-        self.floor_idx = s.floor_index   # the floor selected in the Floors list
+        # prefer the floor of whatever room is actually selected/active --
+        # s.floor_index (the Floors list's own selection) is a DIFFERENT,
+        # easily out-of-sync property from the Rooms list's selection, so a
+        # user who picked their room via the Rooms panel (or clicked it in
+        # the viewport) could have it point at an entirely different floor,
+        # silently searching the wrong floor's rooms for the path
+        active = context.view_layer.objects.active
+        room_fi = _room_index_for_object(active, s)
+        self.floor_idx = s.rooms[room_fi].floor_index if room_fi is not None else s.floor_index
         fl = _floor_by_index(context, self.floor_idx)
         if not fl:
             self.report({'ERROR'}, "Select a floor in the Floors list")
             return {'CANCELLED'}
         if not any(r.floor_index == self.floor_idx for r in s.rooms):
-            self.report({'ERROR'}, "No rooms on this floor - click 'Make Floor Walls' first")
+            self.report({'ERROR'}, "No room outline on this floor - click 'Reset Room Outline' first")
             return {'CANCELLED'}
         self.base_z = fl[0]
         self.pts = []
@@ -4058,18 +4954,23 @@ class GN_OT_split_room_path(Operator):
         return {'RUNNING_MODAL'}
 
     def _commit(self, context):
-        mid = sum(self.pts, Vector((0.0, 0.0))) / len(self.pts)
-        ridx = _room_at_point(context, self.floor_idx, mid)
-        if ridx < 0:
-            self.report({'WARNING'}, "Path midpoint not inside a room")
-            return
-        made = split_room_record_path(context, ridx, self.pts)
-        if made:
-            self.report({'INFO'}, "Room split")
-        else:
-            self.report({'WARNING'},
-                        "Split failed (path must cross the room, ends on two "
-                        "different walls)")
+        # Try the actual split against every room on this floor rather than
+        # pre-checking whether some proxy point (the raw average of all
+        # clicked points) sits inside one -- for a bent/L-shaped path near a
+        # corner that average routinely lands outside the room even though
+        # the path itself is a perfectly valid cut (split_polygon_path snaps
+        # each endpoint to its nearest wall edge regardless of exactly where
+        # it was clicked, so it doesn't need the points to be inside at all).
+        s = context.scene.gn_int
+        for i, r in enumerate(s.rooms):
+            if r.floor_index != self.floor_idx:
+                continue
+            if split_room_record_path(context, i, self.pts):
+                self.report({'INFO'}, "Room split")
+                return
+        self.report({'WARNING'},
+                    "Split failed (path must cross a room on this floor, "
+                    "ends on two different walls)")
 
     def _end(self, context, ok):
         bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
@@ -4081,9 +4982,12 @@ class GN_OT_split_room_path(Operator):
 class GN_OT_split_edges(Operator):
     bl_idname = "gn_int.split_edges"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_label = "Split at Selected Edges"
-    bl_description = ("Edit Mode: select two edges (one on each of two opposite "
-                      "walls) of a room, then run this to cut the room between them")
+    bl_label = "Split at Selected Points"
+    bl_description = ("Edit Mode: select two points (vertices) -- one on each "
+                      "of two opposite walls -- and run this to cut exactly "
+                      "between them. Subdivide a wall edge first (Blender's "
+                      "own Subdivide/Loop Cut) to add a point wherever you "
+                      "want the cut, then select it")
 
     @classmethod
     def poll(cls, context):
@@ -4094,24 +4998,23 @@ class GN_OT_split_edges(Operator):
         ob = context.edit_object
         bm = bmesh.from_edit_mesh(ob.data)
         mw = ob.matrix_world
+        # cut line = the selected POINTS themselves, at their exact position
+        # -- selecting an edge selects both its vertices too, so this covers
+        # edge selection as well (using the edge's two endpoints), but the
+        # intended way to work is Vertex select mode: pick precisely where
+        # you want the cut to start and end
         pts = []
-        for e in bm.edges:
-            if e.select:
-                for v in e.verts:
-                    w = mw @ v.co
-                    pts.append(Vector((w.x, w.y)))
-        if not pts:                       # fall back to selected verts
-            for v in bm.verts:
-                if v.select:
-                    w = mw @ v.co
-                    pts.append(Vector((w.x, w.y)))
-        # collapse near-coincident points (a vertical wall edge -> one XY point)
+        for v in bm.verts:
+            if v.select:
+                w = mw @ v.co
+                pts.append(Vector((w.x, w.y)))
+        # collapse near-coincident points
         uniq = []
         for p in pts:
             if not any((p - q).length < 0.05 for q in uniq):
                 uniq.append(p)
         if len(uniq) < 2:
-            self.report({'ERROR'}, "Select two edges on opposite walls")
+            self.report({'ERROR'}, "Select two points on opposite walls")
             return {'CANCELLED'}
         # cut line = the two farthest-apart selected points
         A, B = uniq[0], uniq[1]
@@ -4122,7 +5025,12 @@ class GN_OT_split_edges(Operator):
                 if dd > bd:
                     bd = dd
                     A, B = uniq[i], uniq[j]
-        # which room? use the object's uid tag, else the room under the cut midpoint
+        # which room? use the object's uid tag, else the room under the cut
+        # midpoint -- ONLY among rooms on the same floor as the edited
+        # object, otherwise a point that happens to fall inside some other
+        # floor's room polygon (entirely possible -- floors routinely
+        # overlap in X/Y, they're only separated in Z) would silently split
+        # the wrong floor
         ruid = ob.get("gn_room_uid")
         mid = (A + B) * 0.5
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -4131,7 +5039,10 @@ class GN_OT_split_edges(Operator):
         if ruid is not None:
             ridx = next((i for i, r in enumerate(s.rooms) if r.uid == ruid), -1)
         if ridx < 0:
+            floor_idx = _floor_index_for_object(ob, s)
             for i, r in enumerate(s.rooms):
+                if floor_idx is not None and r.floor_index != floor_idx:
+                    continue
                 try:
                     poly = [Vector(pt) for pt in json.loads(r.poly_json)]
                 except Exception:
@@ -4140,10 +5051,13 @@ class GN_OT_split_edges(Operator):
                     ridx = i
                     break
         if ridx < 0:
-            self.report({'WARNING'}, "Could not resolve which room these edges belong to")
+            if not s.rooms:
+                self.report({'WARNING'}, "No room outline yet - click 'Reset Room Outline' first")
+            else:
+                self.report({'WARNING'}, "Could not resolve which room these edges belong to")
             return {'CANCELLED'}
         if split_room_record(context, ridx, A, B):
-            self.report({'INFO'}, "Room split between the selected edges")
+            self.report({'INFO'}, "Room split between the selected points")
             return {'FINISHED'}
         self.report({'WARNING'}, "Split failed - the two edges must be on opposite walls")
         return {'CANCELLED'}
@@ -4171,25 +5085,23 @@ def _selected_edge_endpoints(context):
 _STAIR_MATS = (("GN_StairTop", (0.55, 0.45, 0.35, 1.0)),   # 0 -- treads
               ("GN_StairSide", (0.55, 0.55, 0.57, 1.0)))   # 1 -- risers, side wedges, soffit
 MAT_STAIR_TOP, MAT_STAIR_SIDE = 0, 1
-
-
-_STAIR_NOSING_ARC_SEGS = 4
+_STAIR_NOSING_WIDTH_MULT = 1.8  # nosing overhang is wider than it is deep
 
 
 def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=0.0):
     """Solid staircase (treads, risers, closed sides, flat bottom, flat back)
     running from edge (b0,b1) up to edge (t0,t1). Each edge is assumed
     roughly level (flat at its own Z); the two edges need not be parallel or
-    the same length -- the sides taper linearly between them. nosing > 0
-    rounds each tread's front edge into a small overhanging lip (radius =
-    nosing), recessing the riser to match -- a quarter-circle profile, swept
-    across the width. The solid is a plain stepped block: flat at z_bot
-    underneath and flat at the back (t=1), NOT a smooth diagonal soffit --
-    that read as a bizarre diagonal wedge cut through every step rather than
-    a normal staircase silhouette. Returns (verts, faces, cats) in world
-    space -- cats parallels faces with a MAT_STAIR_* index per face -- or
-    None if the edges are too close in height or in the travel direction to
-    form a run."""
+    the same length -- the sides taper linearly between them. nosing > 0 cuts
+    a small flat chamfer at each tread's top-front corner (depth = nosing on
+    both the tread and the riser) -- NOT an overhang, NOT a curve: the tread
+    and riser keep their normal positions, only that one small corner is cut
+    away. The solid is a plain stepped block: flat at z_bot underneath and
+    flat at the back (t=1), NOT a smooth diagonal soffit -- that read as a
+    bizarre diagonal wedge cut through every step rather than a normal
+    staircase silhouette. Returns (verts, faces, cats) in world space --
+    cats parallels faces with a MAT_STAIR_* index per face -- or None if the
+    edges are too close in height or in the travel direction to form a run."""
     b_mid = (b0 + b1) / 2; t_mid = (t0 + t1) / 2
     if t_mid.z < b_mid.z:
         b0, b1, t0, t1 = t0, t1, b0, b1
@@ -4218,8 +5130,29 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         v = Vector((bx - fx, by - fy))
         return v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0))
 
-    thetas = [(k / _STAIR_NOSING_ARC_SEGS) * (math.pi / 2)
-             for k in range(_STAIR_NOSING_ARC_SEGS + 1)]
+    def fillet_arc(center, fdir, p_from, p_to, r, segs=4):
+        # segs+1 points tracing a circular arc of radius r about `center`,
+        # from p_from to p_to, confined to the vertical plane spanned by the
+        # horizontal unit direction fdir and world +Z (true for every corner
+        # here, since each fillet only ever moves along the tread-depth
+        # direction and straight up/down). Endpoints must already sit
+        # exactly on that circle -- this only fills in the curve between
+        # them, it does not enforce the radius itself.
+        def ang_of(p):
+            a = (p[0] - center[0]) * fdir.x + (p[1] - center[1]) * fdir.y
+            b = p[2] - center[2]
+            return math.atan2(b, a)
+        ang1, ang2 = ang_of(p_from), ang_of(p_to)
+        while ang2 - ang1 > math.pi:
+            ang2 -= 2 * math.pi
+        while ang2 - ang1 < -math.pi:
+            ang2 += 2 * math.pi
+        pts = []
+        for i in range(segs + 1):
+            ang = ang1 + (ang2 - ang1) * (i / segs)
+            ca, cb = math.cos(ang) * r, math.sin(ang) * r
+            pts.append((center[0] + ca * fdir.x, center[1] + ca * fdir.y, center[2] + cb))
+        return pts
 
     verts, faces, cats = [], [], []
 
@@ -4236,7 +5169,10 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         cats.append(cat)
 
     def step_nosing_r(rise_):
-        return min(nosing, rise_ * 0.9) if nosing > 1e-4 else 0.0
+        # R itself gets scaled up by _STAIR_NOSING_WIDTH_MULT for the
+        # vertical drop face -- clamp so THAT scaled value still fits
+        # within the riser, not R before scaling
+        return min(nosing, rise_ * 0.9 / _STAIR_NOSING_WIDTH_MULT) if nosing > 1e-4 else 0.0
 
     # treads, risers, and the rounded nosing underside (per step, spanning
     # the full width from side0 to side1)
@@ -4250,22 +5186,52 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
         R = step_nosing_r(rise)
 
         if R > 1e-4:
+            # square-edge nosing: right angles only, no curve, no diagonal.
+            # The tread overhangs forward by R (tip), drops straight down by
+            # Rd (the small vertical face), then tucks straight back to the
+            # riser's own plane at xf (a small horizontal face) before the
+            # riser continues straight down as normal. Rd > R so the
+            # vertical face reads as a distinct lip rather than a square nub.
+            Rd = R * _STAIR_NOSING_WIDTH_MULT
+            # smooth rounded fillet at the two sharp right-angle corners of
+            # the notch (tip<->drop and drop<->tuck) -- a small quarter-
+            # circle arc, built as an explicit quad strip between the two
+            # step sides (never a single n-gon), so it stays safe the same
+            # way the square notch itself does. Bv < min(R, Rd) so each
+            # fillet stays within its own two adjacent edges.
+            Bv = min(R, Rd) * 0.35
             f0 = fwd(x0f, y0f, x0b, y0b)
             f1 = fwd(x1f, y1f, x1b, y1b)
+            tip0 = (x0f - f0.x * R, y0f - f0.y * R, zh)
+            tip1 = (x1f - f1.x * R, y1f - f1.y * R, zh)
+            drop0 = (tip0[0], tip0[1], zh - Rd)
+            drop1 = (tip1[0], tip1[1], zh - Rd)
+            tuck0 = (x0f, y0f, zh - Rd)
+            tuck1 = (x1f, y1f, zh - Rd)
 
-            def arc(fx, fy, f, theta):
-                off = -R + R * math.sin(theta)
-                zz = (zh - R) + R * math.cos(theta)
-                return (fx + f.x * off, fy + f.y * off, zz)
+            tipC0 = (tip0[0] + f0.x * Bv, tip0[1] + f0.y * Bv, zh - Bv)
+            tipC1 = (tip1[0] + f1.x * Bv, tip1[1] + f1.y * Bv, zh - Bv)
+            tipArc0 = fillet_arc(tipC0, f0, (tip0[0] + f0.x * Bv, tip0[1] + f0.y * Bv, zh), (tip0[0], tip0[1], zh - Bv), Bv)
+            tipArc1 = fillet_arc(tipC1, f1, (tip1[0] + f1.x * Bv, tip1[1] + f1.y * Bv, zh), (tip1[0], tip1[1], zh - Bv), Bv)
 
-            arc0 = [arc(x0f, y0f, f0, th) for th in thetas]
-            arc1 = [arc(x1f, y1f, f1, th) for th in thetas]
-            tip0, tip1 = arc0[0], arc1[0]           # theta=0: flush with tread top
-            rec0, rec1 = arc0[-1], arc1[-1]         # theta=90: recessed riser start
-            quad(back0, back1, tip1, tip0, MAT_STAIR_TOP)
-            for k in range(_STAIR_NOSING_ARC_SEGS):
-                quad(arc0[k], arc1[k], arc1[k + 1], arc0[k + 1], MAT_STAIR_SIDE)
-            quad(bot0, bot1, rec1, rec0, MAT_STAIR_SIDE)
+            dropC0 = (drop0[0] + f0.x * Bv, drop0[1] + f0.y * Bv, drop0[2] + Bv)
+            dropC1 = (drop1[0] + f1.x * Bv, drop1[1] + f1.y * Bv, drop1[2] + Bv)
+            dropArc0 = fillet_arc(dropC0, f0, (drop0[0], drop0[1], drop0[2] + Bv), (drop0[0] + f0.x * Bv, drop0[1] + f0.y * Bv, drop0[2]), Bv)
+            dropArc1 = fillet_arc(dropC1, f1, (drop1[0], drop1[1], drop1[2] + Bv), (drop1[0] + f1.x * Bv, drop1[1] + f1.y * Bv, drop1[2]), Bv)
+
+            # the whole nosing lip -- tread out to the tip fillet, down the
+            # vertical face, round the drop fillet, back to the riser plane
+            # -- reads as one continuous decorative overhang, so it all
+            # stays MAT_STAIR_TOP. Only the real riser below it (bot to
+            # tuck) is MAT_STAIR_SIDE.
+            quad(back0, back1, tipArc1[0], tipArc0[0], MAT_STAIR_TOP)
+            for k in range(len(tipArc0) - 1):
+                quad(tipArc0[k], tipArc1[k], tipArc1[k + 1], tipArc0[k + 1], MAT_STAIR_TOP)
+            quad(tipArc0[-1], tipArc1[-1], dropArc1[0], dropArc0[0], MAT_STAIR_TOP)
+            for k in range(len(dropArc0) - 1):
+                quad(dropArc0[k], dropArc1[k], dropArc1[k + 1], dropArc0[k + 1], MAT_STAIR_TOP)
+            quad(dropArc0[-1], dropArc1[-1], tuck1, tuck0, MAT_STAIR_TOP)
+            quad(bot0, bot1, tuck1, tuck0, MAT_STAIR_SIDE)
         else:
             quad(back0, back1, (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_TOP)
             quad(bot0, bot1, (x1f, y1f, zh), (x0f, y0f, zh), MAT_STAIR_SIDE)
@@ -4293,27 +5259,31 @@ def _build_stairs_between_edges(b0, b1, t0, t1, step_height, step_depth, nosing=
             xb, yb = side_xy(b, t, tb)
             R = step_nosing_r(rise)
             if R > 1e-4:
+                # same square notch as the tread/riser above -- the full
+                # per-step outline is concave at the notch (it juts out past
+                # xf), so a single face there would leave the renderer to
+                # auto-triangulate a concave shape, which is exactly what
+                # produced the wrong (spiky) result before regardless of how
+                # correct the boundary edges were. Split explicitly instead:
+                # a plain, safely-convex quad for the step's main body (down
+                # to the tuck corner, not z_bot to zh), plus 2 small
+                # triangles -- anchored at the NEAR (xb, zh) corner, not a
+                # far one -- closing just the small notch on its own.
+                Rd = R * _STAIR_NOSING_WIDTH_MULT
+                Bv = min(R, Rd) * 0.35
                 f = fwd(xf, yf, xb, yb)
-                arc_pts = []
-                for k in range(_STAIR_NOSING_ARC_SEGS + 1):  # tip (0) to recessed (90)
-                    th = thetas[k]
-                    off = -R + R * math.sin(th)
-                    zz = (zh - R) + R * math.cos(th)
-                    arc_pts.append((xf + f.x * off, yf + f.y * off, zz))
-                recessed = arc_pts[-1]
-                # the arc bulges OUTWARD past xf, making the full per-step
-                # outline concave there -- a single face over that (an ngon)
-                # is left for the renderer to auto-triangulate, and for a
-                # concave shape that can produce exactly the wrong (spiky)
-                # result regardless of how correct the boundary edges are.
-                # Split explicitly instead: a plain, safely-convex quad for
-                # the step's main body (down to the recessed corner, not
-                # z_bot to zh), plus a small fan -- anchored at the NEAR
-                # (xb, zh) corner, not a far one -- closing just the small
-                # nosing bulge on its own.
-                quad((xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh), recessed, MAT_STAIR_SIDE)
-                for k in range(_STAIR_NOSING_ARC_SEGS):
-                    tri((xb, yb, zh), arc_pts[k], arc_pts[k + 1], MAT_STAIR_SIDE)
+                tip = (xf - f.x * R, yf - f.y * R, zh)
+                drop = (tip[0], tip[1], zh - Rd)
+                tuck = (xf, yf, zh - Rd)
+                tipC = (tip[0] + f.x * Bv, tip[1] + f.y * Bv, zh - Bv)
+                tip_arc = fillet_arc(tipC, f, (tip[0] + f.x * Bv, tip[1] + f.y * Bv, zh), (tip[0], tip[1], zh - Bv), Bv)
+                dropC = (drop[0] + f.x * Bv, drop[1] + f.y * Bv, drop[2] + Bv)
+                drop_arc = fillet_arc(dropC, f, (drop[0], drop[1], drop[2] + Bv), (drop[0] + f.x * Bv, drop[1] + f.y * Bv, drop[2]), Bv)
+                quad((xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh), tuck, MAT_STAIR_SIDE)
+                anchor = (xb, yb, zh)
+                boundary = tip_arc + drop_arc[1:] + [tuck]
+                for k in range(len(boundary) - 1):
+                    tri(anchor, boundary[k], boundary[k + 1], MAT_STAIR_SIDE)
             else:
                 quad((xf, yf, z_bot), (xb, yb, z_bot), (xb, yb, zh), (xf, yf, zh), MAT_STAIR_SIDE)
 
@@ -4390,7 +5360,7 @@ class GN_OT_create_stairs(Operator):
     bl_label = "Create Stairs"
     bl_description = ("Edit Mode: select two edges (one at the bottom, one at "
                       "the top -- can be on two different objects, e.g. two "
-                      "floor boundaries) and build a solid flight of stairs "
+                      "floor maps) and build a solid flight of stairs "
                       "between them")
 
     @classmethod
@@ -4559,6 +5529,7 @@ class GN_OT_project_openings(Operator):
             self.report({'ERROR'}, "Select the window/door pieces to project first")
             return {'CANCELLED'}
         made = skipped = 0
+        no_fit = []            # (width, height) of openings nothing fits
         for o in pieces:
             fr = _piece_frame(o)
             if not fr:
@@ -4589,12 +5560,47 @@ class GN_OT_project_openings(Operator):
                 for r in s.rooms
                 if _room_token_for_uid(context, r.uid) in bordering
                 and (fl := _floor_by_index(context, r.floor_index)))
+            if not op.is_door:
+                # the piece's own bounds, BEFORE they're overwritten below with
+                # the placed window's size -- a later swap still needs to know
+                # how much room the exterior opening actually gives it
+                op.avail_w, op.avail_h = op.hw * 2, op.top - op.sill
+                fit = _best_fit_window_preset(context, op.avail_w, op.avail_h)
+                if fit:
+                    preset, w, h, rotated = fit
+                    op.win_key = preset.library_key or preset.name
+                    op.win_rotated = rotated
+                    # hole is sized to the window actually being placed, not
+                    # the exterior piece -- the piece was only a size reference
+                    # for picking the fit. Re-center on the piece's own center,
+                    # and cut it slightly SMALLER than the frame (FRAME_OVERLAP)
+                    # so the frame overlaps the rough edge instead of leaving
+                    # a visible gap between wall and window.
+                    op.hw = max(w * 0.5 - FRAME_OVERLAP, 0.01)
+                    op.sill = center.z - h * 0.5 + FRAME_OVERLAP
+                    op.top = center.z + h * 0.5 - FRAME_OVERLAP
+                    _place_frame_mesh(op, preset.mesh_object, w, h, 'WINDOW', rotated=rotated, context=context)
+                    op.win_w, op.win_h = w, h
+                    op.win_allow_curtain = preset.allow_curtain
+                    op.win_allow_blinds = preset.allow_blinds
+                else:
+                    # nothing in the library fits -- leave the hole with no
+                    # window rather than squeezing one in distorted
+                    no_fit.append((op.avail_w, op.avail_h))
             made += 1
         rebuild_rooms(context)
         msg = f"Projected {made} selected opening(s)"
         if skipped:
             msg += f" ({skipped} already existed)"
-        self.report({'INFO'}, msg)
+        if no_fit:
+            sizes = ", ".join(f"{w:.2f}x{h:.2f}" for w, h in no_fit[:3])
+            if len(no_fit) > 3:
+                sizes += f", +{len(no_fit) - 3} more"
+            self.report({'WARNING'},
+                        f"{msg} -- no library window fits {len(no_fit)} of them "
+                        f"({sizes}); those got a hole but no window")
+        else:
+            self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -4642,7 +5648,7 @@ class GN_OT_clean_stale_openings(Operator):
     bl_label = "Delete Stale Openings"
     bl_description = ("Delete openings that no longer line up with any current "
                       "room wall (left behind after a room was split, resized, "
-                      "or its boundary was regenerated). Also removes their "
+                      "or its floor map was regenerated). Also removes their "
                       "door frames/thresholds, then rebuilds rooms")
 
     def execute(self, context):
@@ -4672,6 +5678,7 @@ class GN_OT_clear_openings(Operator):
         _clear_coll(DOORFRAME_COLL)
         _clear_coll(WINDOWFRAME_COLL)
         _clear_coll(THRESHOLD_COLL)
+        _clear_coll(CURTAIN_COLL)
         rebuild_rooms(context)
         return {'FINISHED'}
 
@@ -4680,7 +5687,11 @@ class GN_OT_clear_openings(Operator):
 # doors (Room-Tool-style edit mode)
 # ===========================================================================
 def _active_preset(s, kind):
-    """Return (width, height, sill, mesh_object) for the active door/window preset."""
+    """Return (width, height, sill, mesh_object) for the active door/window
+    preset. Windows use the scene's single default_window_sill for every
+    manually-placed window -- not each preset's own registered sill --
+    unless that preset is flagged starts_at_floor, in which case it starts
+    at 0.0 (the room's floor) regardless of the default."""
     if kind == 'DOOR':
         if 0 <= s.active_door_preset < len(s.door_presets):
             p = s.door_presets[s.active_door_preset]
@@ -4688,8 +5699,683 @@ def _active_preset(s, kind):
         return 0.9, 2.0, 0.0, None
     if 0 <= s.active_window_preset < len(s.window_presets):
         p = s.window_presets[s.active_window_preset]
-        return p.width, p.height, p.sill, p.mesh_object
-    return 1.0, 1.2, 0.9, None
+        sill = 0.0 if p.starts_at_floor else s.default_window_sill
+        return p.width, p.height, sill, p.mesh_object
+    return 1.0, 1.2, s.default_window_sill, None
+
+
+def _window_bases(context):
+    """Every window this project can place, as (source, width, height): its
+    own presets (hand-made ones and previously pulled-in library windows)
+    plus every not-yet-local entry in the shared library catalog. `source`
+    is a GN_WindowPreset (already has a mesh_object) or a GN_WindowLibItem
+    (needs _pull_library_entry_into_project first).
+
+    For a preset that has a real mesh, width/height are MEASURED from that
+    mesh, not read from the catalog -- the catalog's numbers can disagree
+    with the geometry they point at (e.g. a sidecar edited without resyncing
+    the .blend), and trusting them makes both fit-checking and placement
+    stretch the window. Library-only entries have no local mesh to measure,
+    so they fall back to the catalog until pulled in."""
+    s = context.scene.gn_int
+    local_keys = {p.library_key for p in s.window_presets if p.library_key}
+    bases = []
+    for p in s.window_presets:
+        if p.mesh_object is not None:
+            native = _native_frame_size(p.mesh_object)
+            w, h = native if native else (p.width, p.height)
+            bases.append((p, w, h))
+    for it in s.winlib_items:
+        if it.category == 'window' and it.key not in local_keys:
+            bases.append((it, it.width, it.height))
+    return bases
+
+
+def _window_candidates(context, avail_w=0.0, avail_h=0.0):
+    """_window_bases expanded into placement candidates
+    (source, width, height, rotated), largest-area first. A can_rotate
+    window also appears sideways, competing on equal footing. avail_w/
+    avail_h > 0 keeps only what fits inside them; 0 means unconstrained
+    (a manually placed window has no exterior opening bounding it)."""
+    candidates = []
+    for source, w, h in _window_bases(context):
+        candidates.append((source, w, h, False))
+        if source.can_rotate:
+            candidates.append((source, h, w, True))
+    if avail_w > 1e-4 and avail_h > 1e-4:
+        # 2mm slack: sub-millimetre float noise (rounded catalog values, a
+        # frozen baseline recomputed from a placed frame) must not be what
+        # decides whether a window fits an opening
+        candidates = [c for c in candidates
+                      if c[1] <= avail_w + FIT_TOL and c[2] <= avail_h + FIT_TOL]
+    return sorted(candidates, key=lambda c: c[1] * c[2], reverse=True)
+
+
+def _candidate_key(source):
+    """Stable id for a candidate, so an opening can record which window is
+    placed there and later be matched back against the candidate list."""
+    if isinstance(source, GN_WindowLibItem):
+        return source.key
+    return source.library_key or source.name
+
+
+def _opening_avail(op):
+    """Bounds a swapped-in window must fit inside for this opening. Falls
+    back to the currently placed window's own size for projected openings
+    recorded before avail_w/avail_h existed -- the best information left
+    once hw/sill/top were resized to the placed window."""
+    if op.avail_w > 1e-4 and op.avail_h > 1e-4:
+        return op.avail_w, op.avail_h
+    if op.projected:
+        return (op.win_w or op.hw * 2), (op.win_h or (op.top - op.sill))
+    return 0.0, 0.0
+
+
+def _native_frame_size(mesh_src):
+    """A mesh's own width/height in the axis convention _place_dressing_mesh
+    uses (Z = height, the larger horizontal extent = width). Placing at these
+    means the mesh isn't scaled at all -- no squashing when a catalog entry's
+    recorded width/height disagrees with the geometry it points at."""
+    if mesh_src is None or not mesh_src.data:
+        return None
+    bb = [Vector(c) for c in mesh_src.bound_box]
+    xs = [c.x for c in bb]; ys = [c.y for c in bb]; zs = [c.z for c in bb]
+    dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
+    if dz < 1e-5 or max(dx, dy) < 1e-5:
+        return None
+    return max(dx, dy), dz
+
+
+def _best_fit_window_preset(context, avail_w, avail_h):
+    """Pick a window to fill a projected exterior opening of size avail_w x
+    avail_h -- searching BOTH this project's already-local presets (hand-
+    made ones like "Standard", and any previously pulled-in library
+    windows) AND every window in the full shared library catalog, so
+    auto-fit isn't limited to whatever's been manually added to the
+    project first. Among candidates that fit within bounds, returns the
+    one with the largest area (closest fit without exceeding) at its own
+    native width/height -- it may leave a small reveal gap inside the
+    rough opening, which is expected. A can_rotate candidate is also tried
+    sideways (width/height swapped), competing on equal footing with its
+    normal orientation. If NOTHING fits, returns None -- the opening still
+    gets its hole, just no window, and the caller reports it. Squeezing the
+    smallest window down to the opening (what this used to do) distorts it
+    non-uniformly, which reads worse than an honest "nothing fits".
+    If the winner came from the library rather than the project's own
+    presets, it's pulled into the project on the spot (appended + a preset
+    created) so it has a real mesh_object to place. A candidate that fails
+    to pull in (e.g. a stale catalog entry whose object no longer exists in
+    the library file) is skipped in favour of the next-best fit rather than
+    failing the whole lookup -- one broken library entry shouldn't silently
+    stop every projection.
+    Returns (preset, width, height, rotated) or None if nothing usable."""
+    bases = _window_bases(context)
+    if not bases:
+        return None
+    fits = _window_candidates(context, avail_w, avail_h)
+
+    def _resolve(source):
+        if not isinstance(source, GN_WindowLibItem):
+            return source
+        resolved, err = _pull_library_entry_into_project(context, source)
+        return resolved
+
+    for source, w, h, rotated in fits:
+        resolved = _resolve(source)
+        if resolved is not None:
+            return resolved, w, h, rotated
+    return None
+
+
+def _apply_window_to_opening(context, op, source, w, h, rotated):
+    """Put `source` (at w x h) into an existing opening, re-cutting the hole
+    to the new window and re-placing the frame. The opening stays where it
+    is: a projected one keeps its CENTRE (that's how projection positioned
+    it inside the exterior piece), a manually placed one keeps its SILL
+    (that's how add_opening positioned it). Hole/frame keep the same
+    FRAME_OVERLAP relationship as first placement.
+    Returns None on success, an error message otherwise."""
+    preset = source
+    if isinstance(source, GN_WindowLibItem):
+        preset, err = _pull_library_entry_into_project(context, source)
+        if preset is None:
+            return err or "Could not pull that window in from the library"
+    if preset.mesh_object is None:
+        return f"'{preset.name}' has no mesh"
+    if op.projected and op.avail_w <= 1e-4:
+        # freeze the available space BEFORE swapping. _opening_avail falls back
+        # to the currently placed window for openings made before avail_* was
+        # recorded -- without pinning it here, swapping to a smaller window
+        # would shrink the budget and you could never swap back up again.
+        op.avail_w, op.avail_h = _opening_avail(op)
+    if not op.projected:
+        # nothing is constraining this opening, so place the window at its
+        # OWN size rather than scaling it to the catalog's numbers (which
+        # squashes it whenever the two disagree). Projected openings keep
+        # the fitted size -- there the exterior piece IS the constraint.
+        native = _native_frame_size(preset.mesh_object)
+        if native:
+            w, h = (native[1], native[0]) if rotated else native
+    if op.projected:
+        center_z = (op.sill + op.top) * 0.5
+        op.sill = center_z - h * 0.5 + FRAME_OVERLAP
+        op.top = center_z + h * 0.5 - FRAME_OVERLAP
+    else:
+        op.top = op.sill + h - 2 * FRAME_OVERLAP
+    op.hw = max(w * 0.5 - FRAME_OVERLAP, 0.01)
+    op.win_w, op.win_h = w, h
+    op.win_rotated = rotated
+    op.win_key = _candidate_key(source)
+    op.win_allow_curtain = preset.allow_curtain
+    op.win_allow_blinds = preset.allow_blinds
+    rebuild_rooms(context)
+    _place_frame_mesh(op, preset.mesh_object, w, h, 'WINDOW',
+                      rotated=rotated, context=context)
+    return None
+
+
+class GN_OT_swap_window(Operator):
+    bl_idname = "gn_int.swap_window"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Swap Window"
+    bl_description = ("Replace the window at this opening with a different one. "
+                      "Only windows that still fit the original exterior opening "
+                      "are offered")
+    key: StringProperty()
+    rotated: BoolProperty(default=False)
+    index: IntProperty(default=-1)      # -1 = the selected opening
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        i = self.index if self.index >= 0 else s.opening_index
+        if not (0 <= i < len(s.openings)):
+            self.report({'WARNING'}, "No opening selected")
+            return {'CANCELLED'}
+        op = s.openings[i]
+        if op.is_door:
+            self.report({'ERROR'}, "That's a door, not a window")
+            return {'CANCELLED'}
+        avail_w, avail_h = _opening_avail(op)
+        # candidates for this key that fit, in both orientations -- prefer the
+        # requested one, else fall back to the other (a can_rotate window that
+        # only fits sideways still fits)
+        options = [c for c in _window_candidates(context, avail_w, avail_h)
+                   if _candidate_key(c[0]) == self.key]
+        match = next((c for c in options if c[3] == self.rotated), None) or \
+            (options[0] if options else None)
+        if match is None:
+            self.report({'ERROR'},
+                        f"That window doesn't fit this opening "
+                        f"({avail_w:.2f} x {avail_h:.2f} available)")
+            return {'CANCELLED'}
+        source, w, h, rotated = match
+        err = _apply_window_to_opening(context, op, source, w, h, rotated)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Swapped in '{source.name}'")
+        return {'FINISHED'}
+
+
+# ===========================================================================
+# shared Window Library (cross-project, mirrors gn_mat_library's shared
+# folder pattern -- but ONE library .blend instead of a folder of DDS files,
+# with a JSON sidecar for the catalog since reading a library .blend's own
+# object custom properties needs fully linking each one first)
+# ===========================================================================
+def _win_lib_prefs():
+    try:
+        return bpy.context.preferences.addons[__name__].preferences
+    except Exception:
+        return None
+
+
+def _win_lib_sidecar_path(blend_path):
+    base, _ext = os.path.splitext(blend_path)
+    return base + ".windows.json"
+
+
+def _bundled_win_lib_path():
+    """The window library shipped INSIDE the add-on folder. Lets the tool
+    work out of the box on a fresh install (any OS -- Windows included)
+    without the user first pointing Preferences at a file."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(here, "window_library", "window_library.blend")
+    return p if os.path.isfile(p) else ""
+
+
+def _win_lib_path():
+    """The active window library: the Preferences path if it's set and the
+    file exists, else the bundled one. Everything that reads or writes the
+    library goes through here, so the fallback is consistent and paths are
+    always absolute (Blender's // relative form resolved)."""
+    prefs = _win_lib_prefs()
+    p = prefs.window_library_path if prefs else ""
+    if p:
+        ap = bpy.path.abspath(p)
+        if os.path.isfile(ap):
+            return ap
+    return _bundled_win_lib_path()
+
+
+class GN_IntPrefs(AddonPreferences):
+    bl_idname = __name__
+    window_library_path: StringProperty(
+        name="Window Library", subtype='FILE_PATH',
+        description="Optional: a shared .blend of library windows used by ALL "
+        "projects. Leave EMPTY to use the library bundled with the add-on. "
+        "Point this at your own file to share one library across a team/machine")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "window_library_path")
+        bundled = _bundled_win_lib_path()
+        if not self.window_library_path:
+            if bundled:
+                layout.label(text="Using the bundled window library.", icon='CHECKMARK')
+            else:
+                layout.label(text="No bundled library found -- set a path above.",
+                             icon='ERROR')
+        layout.operator("gn_int.win_lib_refresh", icon='FILE_REFRESH')
+
+
+def rescan_window_library(context):
+    """Reload the shared Window Library's catalog into s.winlib_items from
+    its JSON sidecar (name/width/height/sill/object_name per entry).
+    Returns the number of entries found."""
+    s = context.scene.gn_int
+    s.winlib_items.clear()
+    path = _win_lib_path()
+    if not path or not os.path.isfile(path):
+        return 0
+    sidecar = _win_lib_sidecar_path(path)
+    if not os.path.isfile(sidecar):
+        return 0
+    try:
+        with open(sidecar, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return 0
+    for entry in data.get("windows", []):
+        key = entry.get("key")
+        obj_name = entry.get("object_name")
+        if not key or not obj_name:
+            continue
+        it = s.winlib_items.add()
+        it.key = key
+        it.object_name = obj_name
+        it.name = entry.get("name", key)
+        it.width = entry.get("width", 1.0)
+        it.height = entry.get("height", 1.2)
+        it.sill = entry.get("sill", 0.9)
+        it.category = entry.get("category", "")
+        it.can_rotate = entry.get("can_rotate", False)
+        it.allow_curtain = entry.get("allow_curtain", True)
+        it.allow_blinds = entry.get("allow_blinds", True)
+        it.starts_at_floor = entry.get("starts_at_floor", False)
+    return len(s.winlib_items)
+
+
+class GN_OT_win_lib_refresh(Operator):
+    bl_idname = "gn_int.win_lib_refresh"
+    bl_options = {'REGISTER'}
+    bl_label = "Refresh Window Library"
+    bl_description = "Rescan the shared Window Library's catalog"
+
+    def execute(self, context):
+        n = rescan_window_library(context)
+        path = _win_lib_path()
+        if not path:
+            self.report({'WARNING'},
+                        "No window library found -- reinstall the add-on or set "
+                        "one in Preferences")
+        else:
+            bundled = (path == _bundled_win_lib_path())
+            self.report({'INFO'},
+                        f"{n} window(s) in library" + (" (bundled)" if bundled else ""))
+        return {'FINISHED'}
+
+
+_CURTAIN_CATEGORIES = {"curtain", "blinds"}
+
+
+def _pull_library_entry_into_project(context, entry):
+    """Append (or, if editing the library file itself, just reference) the
+    given catalog entry's object and add it as a project preset -- a
+    window entry goes to window_presets, a curtain/blinds entry to
+    curtain_presets. Shared by the explicit 'Add to Project' button AND
+    the window auto-fit (_best_fit_window_preset), which pulls a library
+    window in automatically the moment it's chosen -- no manual per-window
+    curation required first.
+    Returns (preset, None) on success, (None, error_message) on failure."""
+    s = context.scene.gn_int
+    is_curtain = entry.category in _CURTAIN_CATEGORIES
+    target = s.curtain_presets if is_curtain else s.window_presets
+    existing = next((p for p in target if p.library_key == entry.key), None)
+    if existing is not None:
+        return existing, None
+    path = _win_lib_path()
+    if not path or not os.path.isfile(path):
+        return None, "Window Library file not set or missing"
+    editing_library_itself = (bpy.data.filepath and
+        os.path.abspath(bpy.data.filepath) == os.path.abspath(path))
+    if editing_library_itself:
+        # can't append a file into itself -- the object is already local,
+        # just use it directly
+        appended = bpy.data.objects.get(entry.object_name)
+        if appended is None:
+            return None, f"'{entry.object_name}' not found in this file"
+    else:
+        with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
+            if entry.object_name not in data_from.objects:
+                return None, f"'{entry.object_name}' not found in the library file"
+            data_to.objects = [entry.object_name]
+        appended = data_to.objects[0] if data_to.objects else None
+        if appended is None:
+            return None, "Append failed"
+        if appended.name not in _get_coll(WINLIB_COLL).objects:
+            _get_coll(WINLIB_COLL).objects.link(appended)
+    p = target.add()
+    p.name = entry.name
+    p.mesh_object = appended
+    p.library_key = entry.key
+    if is_curtain:
+        p.category = entry.category
+        s.active_curtain_preset = len(s.curtain_presets) - 1
+    else:
+        p.width = entry.width
+        p.height = entry.height
+        p.sill = entry.sill
+        p.can_rotate = entry.can_rotate
+        p.allow_curtain = entry.allow_curtain
+        p.allow_blinds = entry.allow_blinds
+        p.starts_at_floor = entry.starts_at_floor
+        s.active_window_preset = len(s.window_presets) - 1
+    return p, None
+
+
+def _resync_mesh_from_library(context, preset):
+    """Re-append preset's source object from the shared library file and
+    replace its already-local mesh's geometry IN PLACE (same Mesh ID, not
+    a new datablock) -- every placed instance (GN_Frame_*/GN_Curtain_*)
+    shares that one Mesh ID via _place_dressing_mesh, so this updates all
+    of them at once without touching the scene. Also re-copies the
+    catalog's width/height/sill/can_rotate/allow_curtain/allow_blinds onto
+    the preset (window presets only -- curtain presets have no such
+    fields), since those are cached separately from the mesh and drive
+    wall-hole sizing for manual placement -- geometry alone getting out of
+    sync with them would cut holes the wrong size. Fixes edits made
+    directly in the library .blend (e.g. corrected normals, resized
+    windows) not reaching windows already pulled into a project before the
+    edit -- 'Refresh' only reloads the JSON sidecar's metadata display, it
+    never touches an already-local preset's mesh or cached dimensions.
+    Returns None on success, an error message on failure."""
+    s = context.scene.gn_int
+    if preset.mesh_object is None or preset.mesh_object.data is None:
+        return "Preset has no mesh"
+    path = _win_lib_path()
+    if not path or not os.path.isfile(path):
+        return "Window Library file not set or missing"
+    if bpy.data.filepath and os.path.abspath(bpy.data.filepath) == os.path.abspath(path):
+        return "Editing the library file itself -- nothing to resync"
+    entry = next((it for it in s.winlib_items if it.key == preset.library_key), None)
+    src_name = entry.object_name if entry else preset.mesh_object.name
+    with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
+        if src_name not in data_from.objects:
+            return f"'{src_name}' not found in the library file"
+        data_to.objects = [src_name]
+    fresh = data_to.objects[0] if data_to.objects else None
+    if fresh is None or fresh.data is None:
+        return "Append failed"
+    old_mesh = preset.mesh_object.data
+    fresh_mesh = fresh.data
+    bm = bmesh.new()
+    bm.from_mesh(fresh_mesh)
+    bm.to_mesh(old_mesh)
+    bm.free()
+    old_mesh.update()
+    bpy.data.objects.remove(fresh, do_unlink=True)
+    if fresh_mesh.users == 0:
+        bpy.data.meshes.remove(fresh_mesh)
+    if entry is not None and hasattr(preset, "width"):
+        preset.width = entry.width
+        preset.height = entry.height
+        preset.sill = entry.sill
+        preset.can_rotate = entry.can_rotate
+        preset.allow_curtain = entry.allow_curtain
+        preset.allow_blinds = entry.allow_blinds
+        preset.starts_at_floor = entry.starts_at_floor
+    return None
+
+
+class GN_OT_win_lib_resync_mesh(Operator):
+    bl_idname = "gn_int.win_lib_resync_mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Resync Mesh Geometry from Library"
+    bl_description = ("Pull updated geometry (e.g. fixed normals) from the "
+                      "shared library file into every window/curtain mesh "
+                      "already used in this project. Refresh above only "
+                      "reloads names/dimensions, never geometry -- use this "
+                      "after editing meshes directly in the library file")
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        presets = [p for p in list(s.window_presets) + list(s.curtain_presets)
+                  if p.library_key]
+        if not presets:
+            self.report({'INFO'}, "No library-sourced presets in this project")
+            return {'CANCELLED'}
+        updated, errors = 0, []
+        for p in presets:
+            err = _resync_mesh_from_library(context, p)
+            if err:
+                errors.append(f"{p.name}: {err}")
+            else:
+                updated += 1
+        if errors:
+            self.report({'WARNING'},
+                        f"Resynced {updated}, {len(errors)} failed -- " + "; ".join(errors[:3]))
+        else:
+            self.report({'INFO'}, f"Resynced {updated} mesh(es)")
+        return {'FINISHED'}
+
+
+class GN_OT_win_lib_add_to_project(Operator):
+    bl_idname = "gn_int.win_lib_add_to_project"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Pick"
+    bl_description = ("For windows: makes this the active window for Window "
+                      "Edit Mode, pulling it into the project first if needed. "
+                      "For curtains/blinds: adds it to the project so it can "
+                      "be picked from the Curtains list")
+    key: StringProperty()
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        entry = next((it for it in s.winlib_items if it.key == self.key), None)
+        if entry is None:
+            self.report({'ERROR'}, "Library entry not found - try refreshing the library")
+            return {'CANCELLED'}
+        is_curtain = entry.category in _CURTAIN_CATEGORIES
+        target = s.curtain_presets if is_curtain else s.window_presets
+        existing_idx = next((i for i, p in enumerate(target) if p.library_key == self.key), -1)
+        if existing_idx >= 0:
+            if not is_curtain:
+                s.active_window_preset = existing_idx
+                self.report({'INFO'}, f"'{entry.name}' is now the active window")
+                return {'FINISHED'}
+            self.report({'INFO'}, f"'{entry.name}' is already in this project")
+            return {'CANCELLED'}
+        p, err = _pull_library_entry_into_project(context, entry)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Added '{p.name}' to project")
+        return {'FINISHED'}
+
+
+class GN_OT_win_lib_remove_from_project(Operator):
+    bl_idname = "gn_int.win_lib_remove_from_project"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Remove from Project"
+    bl_description = ("Remove this preset from the project. Its appended "
+                      "object is also deleted, unless another preset still uses it")
+    index: IntProperty(default=-1)
+    kind: EnumProperty(items=[('WINDOW', "Window", ""), ('CURTAIN', "Curtain", "")],
+                       default='WINDOW', options={'HIDDEN'})
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        presets = s.curtain_presets if self.kind == 'CURTAIN' else s.window_presets
+        active_attr = "active_curtain_preset" if self.kind == 'CURTAIN' else "active_window_preset"
+        i = self.index if self.index >= 0 else getattr(s, active_attr)
+        if not (0 <= i < len(presets)):
+            self.report({'WARNING'}, "No preset selected")
+            return {'CANCELLED'}
+        ob = presets[i].mesh_object
+        presets.remove(i)
+        setattr(s, active_attr, max(0, min(i, len(presets) - 1)))
+        if ob is not None and not any(p.mesh_object == ob for p in presets):
+            me = ob.data
+            bpy.data.objects.remove(ob, do_unlink=True)
+            if me and me.users == 0:
+                bpy.data.meshes.remove(me)
+        return {'FINISHED'}
+
+
+class GN_OT_lib_register_window(Operator):
+    bl_idname = "gn_int.lib_register_window"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Register Selected"
+    bl_description = ("Add the active mesh object to the shared Window "
+                      "Library as a new catalog entry (re-registering the "
+                      "same object updates its entry in place). Backs up "
+                      "the library file first")
+
+    reg_name: StringProperty(name="Name", default="")
+    reg_category: EnumProperty(name="Category", default='window',
+        items=[('window', "Window", ""), ('curtain', "Curtain", ""),
+               ('blinds', "Blinds", "")])
+    reg_can_rotate: BoolProperty(name="Can Rotate (works horizontal or vertical)", default=False)
+    reg_allow_curtain: BoolProperty(name="Allows Curtains", default=True)
+    reg_allow_blinds: BoolProperty(name="Allows Blinds", default=True)
+    reg_starts_at_floor: BoolProperty(name="Starts at Floor", default=False,
+        description="Starts at the room's floor instead of the scene's "
+        "default window sill height (e.g. a French window/floor-length window)")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == 'MESH'
+
+    def invoke(self, context, event):
+        if not self.reg_name:
+            self.reg_name = context.active_object.name.replace("_", " ").title()
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "reg_name")
+        layout.prop(self, "reg_category")
+        if self.reg_category == 'window':
+            layout.prop(self, "reg_can_rotate")
+            layout.prop(self, "reg_allow_curtain")
+            layout.prop(self, "reg_allow_blinds")
+            layout.prop(self, "reg_starts_at_floor")
+
+    def execute(self, context):
+        path = _win_lib_path()
+        if not path:
+            self.report({'ERROR'}, "Set a Window Library file in add-on Preferences first")
+            return {'CANCELLED'}
+        ob = context.active_object
+        sidecar = _win_lib_sidecar_path(path)
+
+        data = {"windows": []}
+        if os.path.isfile(sidecar):
+            try:
+                with open(sidecar, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {"windows": []}
+        data.setdefault("windows", [])
+
+        # re-registering the exact same source object updates its own entry
+        # in place; otherwise mint a fresh key that doesn't collide
+        same_obj_entry = next((e for e in data["windows"] if e.get("object_name") == ob.name), None)
+        if same_obj_entry:
+            key = same_obj_entry["key"]
+        else:
+            base_key = re.sub(r"[^A-Za-z0-9_]+", "_", (self.reg_name or ob.name)).strip("_") or ob.name
+            existing_keys = {e.get("key") for e in data["windows"] if e.get("key")}
+            key = base_key
+            i = 2
+            while key in existing_keys:
+                key = f"{base_key}_{i}"
+                i += 1
+
+        # back up the current library file + sidecar before touching either
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_blend = None
+        if os.path.isfile(path):
+            backup_blend = f"{path}.backup_{timestamp}.blend"
+            shutil.copyfile(path, backup_blend)
+        if os.path.isfile(sidecar):
+            shutil.copyfile(sidecar, f"{sidecar}.backup_{timestamp}.json")
+
+        # merge: pull in every OTHER existing library object from the
+        # (just-made) backup copy, linked -- never link from and overwrite
+        # the same live path in one operation
+        existing_objs = []
+        read_from = backup_blend or path
+        rename_map = {}
+        if os.path.isfile(read_from):
+            # append (link=False), not link -- these need to become fully
+            # local datablocks in this session for libraries.write() to
+            # reliably re-serialize them into the (different) live path.
+            # If an object of the same name already exists in THIS session
+            # (e.g. it was previously pulled into a project), Blender
+            # renames the freshly-appended copy (a ".001" suffix) -- track
+            # that so the sidecar's object_name stays in sync with whatever
+            # actually ends up written into the file
+            with bpy.data.libraries.load(read_from, link=False) as (data_from, data_to):
+                requested = [n for n in data_from.objects if n != ob.name]
+                requested_names = list(requested)  # keep a copy: assigning
+                data_to.objects = requested         # this mutates `requested`
+                                                     # in place (strings -> objects)
+            existing_objs = [o for o in data_to.objects if o is not None]
+            rename_map = dict(zip(requested_names, [o.name for o in existing_objs]))
+
+        bpy.data.libraries.write(path, set(existing_objs) | {ob}, fake_user=True)
+
+        for o in existing_objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+
+        mn = [min(v[i] for v in ob.bound_box) for i in range(3)]
+        mx = [max(v[i] for v in ob.bound_box) for i in range(3)]
+        entry = {
+            "key": key, "object_name": ob.name, "name": self.reg_name or ob.name,
+            "width": round(mx[0] - mn[0], 3), "height": round(mx[2] - mn[2], 3),
+            "sill": 0.9, "category": self.reg_category,
+        }
+        if self.reg_category == 'window':
+            entry["can_rotate"] = self.reg_can_rotate
+            entry["allow_curtain"] = self.reg_allow_curtain
+            entry["allow_blinds"] = self.reg_allow_blinds
+            entry["starts_at_floor"] = self.reg_starts_at_floor
+
+        data["windows"] = [e for e in data["windows"] if e.get("key") != key]
+        for e in data["windows"]:
+            old_name = e.get("object_name")
+            if old_name in rename_map:
+                e["object_name"] = rename_map[old_name]
+        data["windows"].append(entry)
+        with open(sidecar, "w") as f:
+            json.dump(data, f, indent=2)
+
+        rescan_window_library(context)
+        self.report({'INFO'}, f"Registered '{entry['name']}' to the library")
+        return {'FINISHED'}
 
 
 def _room_base(obj):
@@ -4713,15 +6399,36 @@ def _frame_coll(kind):
     return DOORFRAME_COLL if kind == 'DOOR' else WINDOWFRAME_COLL
 
 
-def _place_frame_mesh(op, mesh_src, width, height, kind):
-    """Instance a door/window frame mesh into the opening, oriented to the wall.
-    Detects the mesh's own axes from its bounding box (Z=height, the larger
-    horizontal extent=width, the smaller=depth), so any panel-like mesh orients
-    correctly regardless of how it was modelled. Origin-agnostic (uses bbox)."""
+def _place_dressing_mesh(coll, name, mesh_src, cx, cy, nx, ny, sill, width, height,
+                         rotate90=False, reveal_depth=0.0):
+    """Instance mesh_src into coll as `name`, oriented to the wall normal
+    (nx, ny), scaled to width/height, centred at (cx, cy) with its bottom
+    at `sill`. Detects the mesh's own axes from its bounding box (Z=height,
+    the larger horizontal extent=width, the smaller=depth), so any panel-
+    like mesh orients correctly regardless of how it was modelled. Origin-
+    agnostic (uses bbox). Shared by door/window frames and curtain/blind
+    dressing -- re-running with the same `name` replaces it in place.
+
+    rotate90=True places the mesh on its side: its own height axis (Z) runs
+    ALONG the wall (filling `width`) and its wide axis runs vertically
+    (filling `height`) instead -- a real geometric rotation, not just a
+    non-uniform squash of the normal placement (for a can_rotate window
+    used sideways to fit a tall/narrow opening).
+
+    reveal_depth=0.0 places the mesh's own depth-bbox CENTRE at (cx, cy) --
+    (cx, cy) sits on the room's interior wall face, so with reveal_depth=0
+    the mesh straddles that plane, filling only its own native depth
+    (typically far shallower than the reveal jamb cut into the wall,
+    leaving the jamb cavity visibly empty). reveal_depth > 0.0 instead
+    places the mesh's OUTWARD-facing side flush with the plane that many
+    metres out along (nx, ny) -- i.e. flush with the far/exterior end of
+    the reveal recess, filling it from the outside in, matching how the
+    reveal jambs built by _build_wall are actually cut (see wall_margin/
+    win_reveal). 'Outward' is resolved from the mesh's own final placement
+    matrix (which axis actually ends up pointing along +n), not assumed,
+    since the right-handed-determinant fix below can flip it."""
     if mesh_src is None or not mesh_src.data:
-        return
-    coll = _get_coll(_frame_coll(kind))
-    name = f"GN_Frame_{op.uid}"
+        return None
     inst = bpy.data.objects.get(name)
     if inst is None:
         inst = bpy.data.objects.new(name, mesh_src.data)
@@ -4734,17 +6441,28 @@ def _place_frame_mesh(op, mesh_src, width, height, kind):
     cxl, cyl = (min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5
     zbot = min(zs)
 
-    n = Vector((op.nx, op.ny, 0.0)).normalized()
+    n = Vector((nx, ny, 0.0)).normalized()
     along = Vector((-n.y, n.x, 0.0))
     up = Vector((0.0, 0.0, 1.0))
-    sz = height / dz if dz > 1e-4 else 1.0
-    if dx >= dy:                                     # width = local X, depth = local Y
-        colX = along * (width / dx if dx > 1e-4 else 1.0)
-        colY = n
-    else:                                            # width = local Y, depth = local X
-        colX = n
-        colY = along * (width / dy if dy > 1e-4 else 1.0)
-    colZ = up * sz
+    wide_is_x = dx >= dy
+    wide = dx if wide_is_x else dy
+
+    if not rotate90:
+        sz = height / dz if dz > 1e-4 else 1.0
+        sw = width / wide if wide > 1e-4 else 1.0
+        colZ = up * sz
+        if wide_is_x:
+            colX = along * sw; colY = n
+        else:
+            colX = n; colY = along * sw
+    else:
+        sz = width / dz if dz > 1e-4 else 1.0        # mesh's Z -> along the wall
+        sw = height / wide if wide > 1e-4 else 1.0   # mesh's wide axis -> world up
+        colZ = along * sz
+        if wide_is_x:
+            colX = up * sw; colY = n
+        else:
+            colX = n; colY = up * sw
 
     def _mat(cX, cY, cZ):
         return Matrix(((cX.x, cY.x, cZ.x, 0.0),
@@ -4753,14 +6471,88 @@ def _place_frame_mesh(op, mesh_src, width, height, kind):
                        (0.0, 0.0, 0.0, 1.0)))
     R = _mat(colX, colY, colZ)
     if R.to_3x3().determinant() < 0:                 # keep right-handed (no mirrored normals)
-        if dx >= dy:
+        if wide_is_x:
             colY = -colY
         else:
             colX = -colX
         R = _mat(colX, colY, colZ)
-    # place bbox centre (width/depth) at the opening centre, bottom at the sill
-    R.translation = Vector((op.cx, op.cy, op.sill)) - R.to_3x3() @ Vector((cxl, cyl, zbot))
+    # depth anchor: normally the bbox depth-centre, at world offset 0 along n.
+    # With reveal_depth>0, anchor the bbox's OUTWARD face instead (whichever
+    # local extreme actually maps to +n after the flip above), at world
+    # offset reveal_depth along n.
+    depth_min, depth_max = (min(ys), max(ys)) if wide_is_x else (min(xs), max(xs))
+    depth_center = cyl if wide_is_x else cxl
+    depth_col = colY if wide_is_x else colX          # exactly +-n, unit length
+    if abs(reveal_depth) > 1e-6:
+        # reveal_depth may be NEGATIVE: the offset runs along sign(reveal_depth)*n,
+        # because an opening's normal points outward (away from its room) when it
+        # came from an exterior piece, but INTO the room when it came from
+        # _wall_under_cursor. Flush the mesh face that points that same way.
+        rsign = 1.0 if reveal_depth > 0 else -1.0
+        depth_anchor = depth_max if depth_col.dot(n) * rsign > 0 else depth_min
+        target_offset = n * reveal_depth
+    else:
+        depth_anchor = depth_center
+        target_offset = Vector((0.0, 0.0, 0.0))
+    local_point = Vector((cxl, depth_anchor, zbot)) if wide_is_x else Vector((depth_anchor, cyl, zbot))
+    R.translation = Vector((cx, cy, sill)) + target_offset - R.to_3x3() @ local_point
     inst.matrix_world = R
+    return inst
+
+
+def _place_frame_mesh(op, mesh_src, width, height, kind, rotated=False, context=None):
+    """Instance a door/window frame mesh into the opening, oriented to the
+    wall (thin wrapper around _place_dressing_mesh using the opening's own
+    position/normal/sill). For windows, flushes the frame to the outward
+    (exterior) end of the wall's reveal jamb rather than straddling the
+    interior wall face -- matches how _build_wall actually cuts the reveal
+    (wall_margin deep by default), so the frame fills the jamb cavity
+    instead of leaving most of it visibly empty. Doors keep the old
+    centred-on-face placement (their reveal is much shallower, partition*0.5).
+
+    The reveal-depth offset is measured from the wall's own CURRENT line
+    (via _wall_match_for_opening's wall_pt), not raw op.cx/cy -- op.cx/cy
+    is the original projected piece's own centre, which can sit off the
+    wall line by however thick that piece was (or drift if the room's
+    wall was rebuilt since), and _wall_match_for_opening's docstring
+    already flags this exact trap for anything measuring outward from the
+    wall. Falls back to raw op.cx/cy if no current wall match is found
+    (e.g. mid-edit, no room built yet) rather than failing to place.
+
+    op.sill is the HOLE's bottom edge, already shrunk by FRAME_OVERLAP
+    (both call sites -- GN_OT_project_openings and add_opening -- always
+    apply this shrink before calling here). The frame itself must NOT be
+    shrunk to match -- like width (which stays at its own centre via cx/cy,
+    unaffected by op.hw), the frame's own vertical anchor is the hole's
+    sill with that shrink undone, so the frame overlaps the hole by
+    FRAME_OVERLAP at the bottom too, not just the sides/top."""
+    coll = _get_coll(_frame_coll(kind))
+    reveal_depth = 0.0
+    cx, cy = op.cx, op.cy
+    if context is not None and kind == 'WINDOW':
+        s = context.scene.gn_int
+        reveal_depth = s.wall_margin if s.reveal else 0.0
+        if reveal_depth > 1e-6:
+            # want_sign tells us which way THIS opening's normal points
+            # relative to its owning room's wall -- projected-from-exterior
+            # openings point outward (-1 matches), manually-placed ones (from
+            # _wall_under_cursor) point INTO the room (+1 matches). That
+            # direction decides which way the reveal offset must run: the
+            # reveal is always cut from the interior face outward, so an
+            # inward-pointing normal needs a NEGATIVE offset, otherwise the
+            # frame gets pushed out of the wall and floats in front of it.
+            m = _wall_match_for_opening(context, op, -1)
+            if m is None:
+                m = _wall_match_for_opening(context, op, 1)
+                if m is not None:
+                    reveal_depth = -reveal_depth
+            if m:
+                _, wn, wall_pt = m
+                cx, cy = wall_pt.x, wall_pt.y
+    frame_sill = op.sill - FRAME_OVERLAP
+    _place_dressing_mesh(coll, f"GN_Frame_{op.uid}", mesh_src,
+                         cx, cy, op.nx, op.ny, frame_sill, width, height,
+                         rotate90=rotated, reveal_depth=reveal_depth)
 
 
 def _remove_frame_mesh(uid):
@@ -4777,6 +6569,27 @@ def _remove_threshold(uid):
         bpy.data.objects.remove(ob, do_unlink=True)
 
 
+def _place_curtain_mesh(context, op, mesh_src):
+    """Place a curtain/blind overhanging op's actual placed window (op.win_w/
+    win_h), falling back to the opening's own rough bounds if no window was
+    ever placed there. Sized by the scene's curtain overhang tunables."""
+    s = context.scene.gn_int
+    win_w = op.win_w if op.win_w > 1e-4 else op.hw * 2
+    win_h = op.win_h if op.win_h > 1e-4 else (op.top - op.sill)
+    width = win_w + 2 * s.curtain_side_overhang
+    height = win_h + s.curtain_top_overhang + s.curtain_bottom_drop
+    sill = op.sill - s.curtain_bottom_drop
+    coll = _get_coll(CURTAIN_COLL)
+    _place_dressing_mesh(coll, f"GN_Curtain_{op.uid}", mesh_src,
+                         op.cx, op.cy, op.nx, op.ny, sill, width, height)
+
+
+def _remove_curtain_mesh(uid):
+    ob = bpy.data.objects.get(f"GN_Curtain_{uid}")
+    if ob:
+        bpy.data.objects.remove(ob, do_unlink=True)
+
+
 def _refresh_thresholds(context):
     """Rebuild threshold strips for all door openings (or clear them if disabled).
     The strip sits inside ONE room (the side the door normal points to, flippable),
@@ -4784,6 +6597,7 @@ def _refresh_thresholds(context):
     s = context.scene.gn_int
     _clear_coll(THRESHOLD_COLL)
     if not s.add_threshold:
+        _remove_coll_if_empty(THRESHOLD_COLL)
         return
     coll = _get_coll(THRESHOLD_COLL)
     for op in s.openings:
@@ -4818,30 +6632,50 @@ def _refresh_thresholds(context):
             (along.y, n.y, up.y, oy),
             (along.z, n.z, up.z, op.sill),
             (0.0, 0.0, 0.0, 1.0)))
+    _remove_coll_if_empty(THRESHOLD_COLL)   # e.g. enabled but no interior doors yet
 
 
 def add_opening(context, xy, normal, base, kind):
     s = context.scene.gn_int
     w, h, sill, mesh = _active_preset(s, kind)
+    if kind == 'WINDOW':
+        # placement mode has no exterior opening to fit inside, so the window
+        # goes in at its own size -- never scaled to the catalog's declared
+        # width/height, which distorts it if the two disagree
+        native = _native_frame_size(mesh)
+        if native:
+            w, h = native
     op = s.openings.add()
     op.uid = _new_uid(s)
     op.is_door = (kind == 'DOOR')
     op.cx, op.cy = xy.x, xy.y
     op.nx, op.ny = normal.x, normal.y
-    op.hw = w * 0.5
-    op.sill = base + sill
-    op.top = base + sill + h
+    # hole cut slightly smaller than the frame (FRAME_OVERLAP) so the frame
+    # overlaps the rough edge instead of leaving a visible wall/frame gap
+    op.hw = max(w * 0.5 - FRAME_OVERLAP, 0.01)
+    op.sill = base + sill + FRAME_OVERLAP
+    op.top = base + sill + h - FRAME_OVERLAP
     rebuild_rooms(context)                      # also refreshes thresholds
-    _place_frame_mesh(op, mesh, w, h, kind)
+    _place_frame_mesh(op, mesh, w, h, kind, context=context)
+    if kind == 'WINDOW':
+        op.win_w, op.win_h = w, h
+        if 0 <= s.active_window_preset < len(s.window_presets):
+            active = s.window_presets[s.active_window_preset]
+            op.win_allow_curtain = active.allow_curtain
+            op.win_allow_blinds = active.allow_blinds
+            op.win_key = active.library_key or active.name
 
 
 def remove_opening(context, idx):
     s = context.scene.gn_int
     uid = s.openings[idx].uid
     _remove_frame_mesh(uid)
+    _remove_curtain_mesh(uid)
     _remove_threshold(uid)
     s.openings.remove(idx)
     rebuild_rooms(context)
+    for coll_name in (DOORFRAME_COLL, WINDOWFRAME_COLL, THRESHOLD_COLL, CURTAIN_COLL):
+        _remove_coll_if_empty(coll_name)
 
 
 def _wall_under_cursor(context, event, max_dist=0.8):
@@ -4886,6 +6720,26 @@ def _wall_under_cursor(context, event, max_dist=0.8):
     return best
 
 
+def _wall_plane_z(context, event, cx, cy, nx, ny):
+    """Intersect the mouse ray with the vertical plane through (cx, cy) whose
+    normal is (nx, ny, 0) -- the wall's own plane -- returning the world Z
+    where the ray crosses it, or None. Drives vertical (Shift-drag)
+    repositioning of an existing opening the same way _wall_under_cursor
+    drives horizontal placement/sliding."""
+    region = context.region
+    rv3d = context.region_data
+    if region is None or rv3d is None:
+        return None
+    co = (event.mouse_region_x, event.mouse_region_y)
+    origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, co)
+    direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, co)
+    plane_no = Vector((nx, ny, 0.0))
+    if plane_no.length < 1e-6:
+        return None
+    p = intersect_line_plane(origin, origin + direction, Vector((cx, cy, 0.0)), plane_no)
+    return p.z if p is not None else None
+
+
 def _draw_opening_ghost(self, context):
     try:
         if not getattr(self, "hover", None):
@@ -4920,10 +6774,15 @@ class GN_OT_opening_edit(Operator):
     bl_idname = "gn_int.opening_edit"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Opening Edit Mode"
-    bl_description = ("Hover a wall to preview; LMB = add, LMB on an opening = remove, "
-                      "Tab = next preset, Esc/RMB = exit")
+    bl_description = ("Hover a wall to preview; LMB = add. LMB-drag an existing "
+                      "opening to slide it along the wall (hold Shift to move it "
+                      "up/down instead); LMB click with no drag on one = remove. "
+                      "Tab = next preset, Esc/RMB = exit (cancels an in-progress "
+                      "drag back to its start instead, if one is active)")
     kind: EnumProperty(items=[('DOOR', "Door", ""), ('WINDOW', "Window", "")],
                        default='DOOR', options={'HIDDEN'})
+
+    _DRAG_PX = 8
 
     def invoke(self, context, event):
         s = context.scene.gn_int
@@ -4933,11 +6792,14 @@ class GN_OT_opening_edit(Operator):
             p.name = self.kind.title()
         self.hover = None
         self.remove_hover = False
+        self._press = None       # set while LMB is down on an existing opening
+        self._dragging = False   # True once the drag threshold is exceeded
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw_opening_ghost, (self, context), 'WINDOW', 'POST_VIEW')
         context.window_manager.modal_handler_add(self)
         context.area.header_text_set(
-            f"{self.kind.title()} Edit: LMB add · LMB on one to remove · Tab preset · Esc exit")
+            f"{self.kind.title()} Placement: LMB add · drag one to move "
+            "(Shift = up/down) · click one to remove · Tab preset · Esc exit")
         return {'RUNNING_MODAL'}
 
     def _cleanup(self, context):
@@ -4949,6 +6811,55 @@ class GN_OT_opening_edit(Operator):
             context.area.header_text_set(None)
             context.area.tag_redraw()
 
+    def _frame_size_for(self, op):
+        """(width, height) the frame was actually built at -- windows cache
+        this on the opening itself (win_w/win_h); doors don't, so reconstruct
+        it from the hole's own stored size, undoing the FRAME_OVERLAP shrink
+        the same way _place_frame_mesh already does for the sill anchor."""
+        if not op.is_door and op.win_w > 1e-4:
+            return op.win_w, op.win_h
+        return op.hw * 2 + 2 * FRAME_OVERLAP, (op.top - op.sill) + 2 * FRAME_OVERLAP
+
+    def _reposition(self, context, op):
+        frame = bpy.data.objects.get(f"GN_Frame_{op.uid}")
+        if frame is None:
+            return
+        w, h = self._frame_size_for(op)
+        _place_frame_mesh(op, frame, w, h, 'DOOR' if op.is_door else 'WINDOW',
+                          rotated=op.win_rotated, context=context)
+
+    def _cycle_opening_window(self, context, op, backwards=False):
+        """Swap the hovered window for the next one that still fits its
+        opening -- the same Tab that cycles the active preset when you're
+        hovering bare wall, but aimed at an already-placed window."""
+        cands = _window_candidates(context, *_opening_avail(op))
+        if not cands:
+            return
+        cur = next((i for i, c in enumerate(cands)
+                    if _candidate_key(c[0]) == op.win_key and c[3] == op.win_rotated), -1)
+        source, w, h, rotated = cands[(cur + (-1 if backwards else 1)) % len(cands)]
+        _apply_window_to_opening(context, op, source, w, h, rotated)
+
+    def _end_drag(self, context, restore):
+        # rebuild_rooms (bmesh wall/hole rebuild across every room) only
+        # happens HERE, once, on release/cancel -- NOT on every MOUSEMOVE.
+        # Doing full room rebuilds at mouse-move frequency during a drag
+        # was heavy enough to be a real crash risk; live feedback during
+        # the drag itself is just the frame object's matrix_world moving,
+        # which is cheap, and the wall hole catches up in one shot at the end.
+        p = self._press
+        s = context.scene.gn_int
+        idx = next((i for i, o in enumerate(s.openings) if o.uid == p["uid"]), -1)
+        if idx >= 0:
+            op = s.openings[idx]
+            if restore:
+                op.cx, op.cy = p["orig_cx"], p["orig_cy"]
+                op.sill, op.top = p["orig_sill"], p["orig_top"]
+            rebuild_rooms(context)
+            self._reposition(context, op)
+        self._press = None
+        self._dragging = False
+
     def modal(self, context, event):
         try:
             if context.area:
@@ -4957,7 +6868,40 @@ class GN_OT_opening_edit(Operator):
             want_door = (self.kind == 'DOOR')
             if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
                 return {'PASS_THROUGH'}
+
             if event.type == 'MOUSEMOVE':
+                if self._press is not None:
+                    dx = event.mouse_region_x - self._press["start_px"][0]
+                    dy = event.mouse_region_y - self._press["start_px"][1]
+                    if not self._dragging and (dx * dx + dy * dy) >= self._DRAG_PX ** 2:
+                        self._dragging = True
+                    if self._dragging:
+                        p = self._press
+                        idx = next((i for i, o in enumerate(s.openings) if o.uid == p["uid"]), -1)
+                        if idx >= 0:
+                            op = s.openings[idx]
+                            if event.shift:
+                                z = _wall_plane_z(context, event, op.cx, op.cy, op.nx, op.ny)
+                                if z is not None and p["start_z"] is not None:
+                                    delta = z - p["start_z"]
+                                    op.sill = p["orig_sill"] + delta
+                                    op.top = p["orig_top"] + delta
+                            else:
+                                w = _wall_under_cursor(context, event)
+                                if w:
+                                    xy, n, base = w
+                                    # only accept a snap onto the SAME wall
+                                    # direction the opening is already on --
+                                    # don't let a drag jump it to a different
+                                    # (e.g. perpendicular) wall
+                                    if Vector((op.nx, op.ny)).dot(n) > 0.9:
+                                        op.cx, op.cy = xy.x, xy.y
+                            # live feedback only moves the frame object
+                            # itself (cheap) -- the wall hole (rebuild_rooms,
+                            # a full bmesh rebuild) only updates once, on
+                            # release, see _end_drag
+                            self._reposition(context, op)
+                    return {'RUNNING_MODAL'}
                 w = _wall_under_cursor(context, event)
                 if w:
                     xy, n, base = w
@@ -4967,29 +6911,246 @@ class GN_OT_opening_edit(Operator):
                     self.hover = None
                     self.remove_hover = False
                 return {'RUNNING_MODAL'}
+
             if event.type == 'TAB' and event.value == 'PRESS':
+                # hovering an already-placed window? Tab swaps THAT one for the
+                # next library window that still fits its opening (Shift+Tab
+                # goes back), instead of cycling the active preset
+                if self.kind == 'WINDOW' and self.remove_hover and self.hover:
+                    _, xy, _n, base = self.hover
+                    idx = _opening_under(s, xy, base + 0.1, want_door)
+                    if idx >= 0:
+                        self._cycle_opening_window(context, s.openings[idx], event.shift)
+                        return {'RUNNING_MODAL'}
                 presets, attr = _presets_for(s, self.kind)
                 if presets:
                     setattr(s, attr, (getattr(s, attr) + 1) % len(presets))
                 return {'RUNNING_MODAL'}
+
             if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
                 w = _wall_under_cursor(context, event)
                 if w:
                     xy, n, base = w
                     idx = _opening_under(s, xy, base + 0.1, want_door)
                     if idx >= 0:
-                        remove_opening(context, idx)
+                        op = s.openings[idx]
+                        self._press = {
+                            "uid": op.uid,
+                            "start_px": (event.mouse_region_x, event.mouse_region_y),
+                            "orig_cx": op.cx, "orig_cy": op.cy,
+                            "orig_sill": op.sill, "orig_top": op.top,
+                            "start_z": _wall_plane_z(context, event, op.cx, op.cy, op.nx, op.ny),
+                        }
+                        self._dragging = False
                     else:
                         add_opening(context, xy, n, base, self.kind)
                 return {'RUNNING_MODAL'}
+
+            if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+                if self._press is not None:
+                    if self._dragging:
+                        self._end_drag(context, restore=False)
+                    else:
+                        idx = next((i for i, o in enumerate(s.openings)
+                                   if o.uid == self._press["uid"]), -1)
+                        if idx >= 0:
+                            remove_opening(context, idx)
+                        self._press = None
+                return {'RUNNING_MODAL'}
+
             if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+                if self._dragging:
+                    self._end_drag(context, restore=True)
+                    return {'RUNNING_MODAL'}
+                self._press = None
                 self._cleanup(context)
                 return {'FINISHED'}
             return {'RUNNING_MODAL'}
         except Exception as e:
-            print("[GN Interior] opening_edit error:", e)
+            print("[UltimateMLO] opening_edit error:", e)
             self._cleanup(context)
             return {'CANCELLED'}
+
+
+def _active_window_opening(context):
+    """The GN_Opening whose frame is the active object -- or None if the
+    active object isn't a window frame."""
+    vl = context.view_layer
+    ob = vl.objects.active if vl else None
+    if ob is None:
+        return None
+    s = context.scene.gn_int
+    idx = _opening_index_for_object(ob, s)
+    if idx is None or not (0 <= idx < len(s.openings)):
+        return None
+    op = s.openings[idx]
+    return None if op.is_door else op
+
+
+def _reposition_frame_only(context, op):
+    """Move/scale just the frame instance to match the opening's current
+    numbers -- cheap (a matrix update), safe to call every mouse-move during
+    a gizmo drag. The wall HOLE is not recut here; that's the expensive
+    rebuild, debounced to drag-end by _schedule_win_edit_rebuild."""
+    frame = bpy.data.objects.get(f"GN_Frame_{op.uid}")
+    if frame is None:
+        return
+    w = op.win_w if op.win_w > 1e-4 else op.hw * 2
+    h = op.win_h if op.win_h > 1e-4 else (op.top - op.sill)
+    _place_frame_mesh(op, frame, w, h, 'WINDOW', rotated=op.win_rotated, context=context)
+
+
+_GN_WIN_EDIT_REBUILD = {"pending": False}
+
+
+def _schedule_win_edit_rebuild():
+    """Recut the wall hole once a gizmo drag settles. rebuild_rooms is a full
+    bmesh rebuild -- running it per mouse-move was a crash risk -- so debounce
+    it: only the last drag event in a burst triggers one rebuild."""
+    if _GN_WIN_EDIT_REBUILD["pending"]:
+        return
+    _GN_WIN_EDIT_REBUILD["pending"] = True
+
+    def _do():
+        _GN_WIN_EDIT_REBUILD["pending"] = False
+        try:
+            rebuild_rooms(bpy.context)
+        except Exception as e:
+            print("[UltimateMLO] window-edit rebuild:", e)
+        return None
+    bpy.app.timers.register(_do, first_interval=0.2)
+
+
+def _win_gizmo_matrix(center, axis):
+    """4x4 placing a gizmo at `center` (Vector) with its +Z along `axis`."""
+    z = axis.normalized()
+    up = Vector((0.0, 0.0, 1.0))
+    x = (Vector((1.0, 0.0, 0.0)) if abs(z.dot(up)) > 0.99
+         else up.cross(z).normalized())
+    y = z.cross(x).normalized()
+    return Matrix(((x.x, y.x, z.x, center.x),
+                   (x.y, y.y, z.y, center.y),
+                   (x.z, y.z, z.z, center.z),
+                   (0.0, 0.0, 0.0, 1.0)))
+
+
+class GN_GGT_window_edit(bpy.types.GizmoGroup):
+    bl_idname = "GN_GGT_window_edit"
+    bl_label = "Window Edit"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'WINDOW'
+    bl_options = {'3D', 'PERSISTENT'}
+
+    @classmethod
+    def poll(cls, context):
+        s = getattr(context.scene, "gn_int", None)
+        if not s or not s.win_edit_mode:
+            return False
+        return _active_window_opening(context) is not None
+
+    def setup(self, context):
+        a = self.gizmos.new("GIZMO_GT_arrow_3d")
+        a.draw_style = 'NORMAL'; a.length = 0.8
+        a.color = (0.2, 0.85, 0.2); a.alpha = 0.85
+        a.color_highlight = (0.45, 1.0, 0.45); a.alpha_highlight = 1.0
+        a.use_draw_modal = True
+        a.target_set_handler("offset", get=self._get_along, set=self._set_along)
+        self.g_along = a
+
+        v = self.gizmos.new("GIZMO_GT_arrow_3d")
+        v.draw_style = 'NORMAL'; v.length = 0.8
+        v.color = (0.25, 0.5, 1.0); v.alpha = 0.85
+        v.color_highlight = (0.45, 0.65, 1.0); v.alpha_highlight = 1.0
+        v.use_draw_modal = True
+        v.target_set_handler("offset", get=self._get_vert, set=self._set_vert)
+        self.g_vert = v
+
+        sc = self.gizmos.new("GIZMO_GT_arrow_3d")
+        sc.draw_style = 'BOX'; sc.length = 0.6
+        sc.color = (1.0, 0.85, 0.15); sc.alpha = 0.9
+        sc.color_highlight = (1.0, 1.0, 0.4); sc.alpha_highlight = 1.0
+        sc.use_draw_modal = True
+        sc.target_set_handler("offset", get=self._get_scale, set=self._set_scale)
+        self.g_scale = sc
+
+    def refresh(self, context):
+        op = _active_window_opening(context)
+        if op is None:
+            return
+        center = Vector((op.cx, op.cy, (op.sill + op.top) * 0.5))
+        n = Vector((op.nx, op.ny, 0.0))
+        along = Vector((-n.y, n.x, 0.0))
+        self.g_along.matrix_basis = _win_gizmo_matrix(center, along)
+        self.g_vert.matrix_basis = _win_gizmo_matrix(center, Vector((0.0, 0.0, 1.0)))
+        top_corner = Vector((op.cx, op.cy, op.top + 0.08))
+        self.g_scale.matrix_basis = _win_gizmo_matrix(top_corner, along)
+
+    # move along the wall -- capture the base position when the drag starts
+    # (get is called once at drag start), apply the absolute offset in set
+    def _get_along(self):
+        op = _active_window_opening(bpy.context)
+        self._base_cx = op.cx if op else 0.0
+        self._base_cy = op.cy if op else 0.0
+        return 0.0
+
+    def _set_along(self, value):
+        op = _active_window_opening(bpy.context)
+        if op is None:
+            return
+        n = Vector((op.nx, op.ny))
+        along = Vector((-n.y, n.x)).normalized()
+        op.cx = self._base_cx + along.x * value
+        op.cy = self._base_cy + along.y * value
+        _reposition_frame_only(bpy.context, op)
+        _schedule_win_edit_rebuild()
+
+    # move up/down
+    def _get_vert(self):
+        op = _active_window_opening(bpy.context)
+        self._base_sill = op.sill if op else 0.0
+        self._base_top = op.top if op else 0.0
+        return 0.0
+
+    def _set_vert(self, value):
+        op = _active_window_opening(bpy.context)
+        if op is None:
+            return
+        op.sill = self._base_sill + value
+        op.top = self._base_top + value
+        _reposition_frame_only(bpy.context, op)
+        _schedule_win_edit_rebuild()
+
+    # uniform scale -- keeps aspect ratio; projected windows clamp to the
+    # exterior opening they came from
+    def _get_scale(self):
+        op = _active_window_opening(bpy.context)
+        if op:
+            self._base_w = op.win_w if op.win_w > 1e-4 else op.hw * 2
+            self._base_h = op.win_h if op.win_h > 1e-4 else (op.top - op.sill)
+            self._base_cz = (op.sill + op.top) * 0.5
+        else:
+            self._base_w = self._base_h = 1.0
+            self._base_cz = 0.0
+        return 0.0
+
+    def _set_scale(self, value):
+        op = _active_window_opening(bpy.context)
+        if op is None:
+            return
+        w0, h0 = self._base_w, self._base_h
+        factor = max(0.1, 1.0 + value / max(w0, 0.3))
+        if op.projected:
+            aw, ah = _opening_avail(op)
+            if aw > 1e-4 and ah > 1e-4:
+                factor = min(factor, aw / w0, ah / h0)
+        neww, newh = w0 * factor, h0 * factor
+        cz = self._base_cz
+        op.win_w, op.win_h = neww, newh
+        op.hw = max(neww * 0.5 - FRAME_OVERLAP, 0.01)
+        op.sill = cz - newh * 0.5 + FRAME_OVERLAP
+        op.top = cz + newh * 0.5 - FRAME_OVERLAP
+        _reposition_frame_only(bpy.context, op)
+        _schedule_win_edit_rebuild()
 
 
 class GN_OT_preset_add(Operator):
@@ -5024,12 +7185,36 @@ class GN_OT_preset_remove(Operator):
         return {'FINISHED'}
 
 
+def _room_locked_for_opening(context, op):
+    """Index of the (locked) room this opening belongs to, or None -- same
+    _room_for_opening lookup _group_openings_by_room uses, so the warning
+    matches what the Openings panel shows as that opening's room."""
+    s = context.scene.gn_int
+    fi, ri = _room_for_opening(context, op)
+    if ri is not None and ri >= 0 and s.rooms[ri].lock:
+        return ri
+    return None
+
+
 class GN_OT_remove_opening(Operator):
     bl_idname = "gn_int.remove_opening"
     bl_options = {'REGISTER', 'UNDO'}
     bl_label = "Delete Opening"
     bl_description = "Delete the selected opening (its hole, frame mesh and threshold)"
     index: IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        s = context.scene.gn_int
+        i = self.index if self.index >= 0 else s.opening_index
+        if 0 <= i < len(s.openings):
+            ri = _room_locked_for_opening(context, s.openings[i])
+            if ri is not None:
+                self._locked_room = ri
+                return context.window_manager.invoke_confirm(
+                    self, event,
+                    message=f"Room {ri + 1} is locked -- its wall geometry won't "
+                            "change, only the opening record will be removed. Continue?")
+        return self.execute(context)
 
     def execute(self, context):
         s = context.scene.gn_int
@@ -5042,6 +7227,76 @@ class GN_OT_remove_opening(Operator):
         return {'CANCELLED'}
 
 
+class GN_OT_add_curtain(Operator):
+    bl_idname = "gn_int.add_curtain"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Add Curtain"
+    bl_description = ("Dress the selected opening's window with the active "
+                      "curtain/blind preset, overhanging it. Re-running this "
+                      "replaces whatever curtain is already there")
+    index: IntProperty(default=-1)
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        i = self.index if self.index >= 0 else s.opening_index
+        if not (0 <= i < len(s.openings)):
+            self.report({'WARNING'}, "No opening selected")
+            return {'CANCELLED'}
+        op = s.openings[i]
+        if op.is_door:
+            self.report({'ERROR'}, "Curtains/blinds are for windows, not doors")
+            return {'CANCELLED'}
+        if not (0 <= s.active_curtain_preset < len(s.curtain_presets)):
+            self.report({'ERROR'}, "No curtain/blind preset selected - add one from the library first")
+            return {'CANCELLED'}
+        preset = s.curtain_presets[s.active_curtain_preset]
+        if preset.mesh_object is None:
+            self.report({'ERROR'}, "That preset has no mesh")
+            return {'CANCELLED'}
+        if preset.category == 'blinds' and not op.win_allow_blinds:
+            self.report({'ERROR'}, "This window doesn't support blinds")
+            return {'CANCELLED'}
+        if preset.category == 'curtain' and not op.win_allow_curtain:
+            self.report({'ERROR'}, "This window doesn't support curtains")
+            return {'CANCELLED'}
+        _place_curtain_mesh(context, op, preset.mesh_object)
+        self.report({'INFO'}, f"Added '{preset.name}' to the selected opening")
+        return {'FINISHED'}
+
+
+class GN_OT_remove_curtain(Operator):
+    bl_idname = "gn_int.remove_curtain"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Remove Curtain"
+    bl_description = "Remove the curtain/blind from the selected opening (window stays)"
+    index: IntProperty(default=-1)
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        i = self.index if self.index >= 0 else s.opening_index
+        if not (0 <= i < len(s.openings)):
+            self.report({'WARNING'}, "No opening selected")
+            return {'CANCELLED'}
+        _remove_curtain_mesh(s.openings[i].uid)
+        _remove_coll_if_empty(CURTAIN_COLL)
+        return {'FINISHED'}
+
+
+class GN_OT_select_opening(Operator):
+    bl_idname = "gn_int.select_opening"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_label = "Select Opening"
+    bl_description = "Highlight this opening and select its frame/threshold object"
+    index: IntProperty(default=-1)
+
+    def execute(self, context):
+        s = context.scene.gn_int
+        if 0 <= self.index < len(s.openings):
+            s.opening_index = self.index
+            return {'FINISHED'}
+        return {'CANCELLED'}
+
+
 # ===========================================================================
 # UI
 # ===========================================================================
@@ -5049,6 +7304,51 @@ class GN_UL_door_presets(bpy.types.UIList):
     def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
         layout.prop(item, "name", text="", emboss=False, icon='MESH_DATA')
         layout.label(text=f"{item.width:.2f}x{item.height:.2f}")
+
+
+class GN_UL_window_library(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        s = ctx.scene.gn_int
+        row = layout.row(align=True)
+        row.label(text=item.name, icon='MESH_PLANE')
+        row.label(text=f"{item.width:.2f}x{item.height:.2f}  sill {item.sill:.2f}")
+        active_idx = next((i for i, p in enumerate(s.window_presets)
+                           if p.library_key == item.key), -1)
+        is_active = active_idx >= 0 and active_idx == s.active_window_preset
+        # clicking the row itself picks it (winlib_index's update callback);
+        # this is just a status indicator, not a separate action
+        if is_active:
+            row.label(text="Active", icon='CHECKMARK')
+
+    def filter_items(self, ctx, data, propname):
+        items = getattr(data, propname)
+        flt = [self.bitflag_filter_item] * len(items)
+        for i, it in enumerate(items):
+            if it.category in _CURTAIN_CATEGORIES:
+                flt[i] &= ~self.bitflag_filter_item
+        return flt, []
+
+
+class GN_UL_curtain_library(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        row = layout.row(align=True)
+        row.label(text=item.name, icon='MESH_PLANE')
+        row.label(text=item.category.title() if item.category else "")
+        # clicking the row picks it (winlib_index's update callback) -- this is
+        # just a status indicator, like the window library list
+        s = ctx.scene.gn_int
+        idx = next((i for i, p in enumerate(s.curtain_presets)
+                    if p.library_key == item.key), -1)
+        if idx >= 0 and idx == s.active_curtain_preset:
+            row.label(text="Active", icon='CHECKMARK')
+
+    def filter_items(self, ctx, data, propname):
+        items = getattr(data, propname)
+        flt = [self.bitflag_filter_item] * len(items)
+        for i, it in enumerate(items):
+            if it.category not in _CURTAIN_CATEGORIES:
+                flt[i] &= ~self.bitflag_filter_item
+        return flt, []
 
 
 class GN_UL_openings(bpy.types.UIList):
@@ -5080,17 +7380,30 @@ class GN_UL_floors(bpy.types.UIList):
         row = layout.row(align=True)
         row.label(text=f"Floor {index+1}", icon='DECORATE')
         row.label(text=f"z {item.z:.2f}  h {h:.2f}m")
-        # lock: keep a hand-edited boundary (Generate skips locked floors)
+        # "saved as final" indicator -- set automatically by Save Floor Map
+        # as Final, not user-togglable (no room.prop here on purpose)
+        if item.lock:
+            row.label(text="", icon='CHECKMARK')
+        op = row.operator("gn_int.remove_floor", text="", icon='TRASH')
+        op.index = index
+
+
+class GN_UL_rooms(bpy.types.UIList):
+    def draw_item(self, ctx, layout, data, item, icon, adata, aprop, index=0, flt=0):
+        row = layout.row(align=True)
+        row.label(text=f"Floor {item.floor_index+1} · Room {index+1}", icon='MESH_CUBE')
+        # lock: keep a hand-resized room's mesh exactly as-is (rebuild_rooms
+        # skips it) -- its opening cuts also stop updating while locked
         row.prop(item, "lock", text="",
                  icon='LOCKED' if item.lock else 'UNLOCKED', emboss=False)
-        op = row.operator("gn_int.remove_floor", text="", icon='TRASH')
+        op = row.operator("gn_int.remove_room", text="", icon='TRASH')
         op.index = index
 
 
 class _PanelBase:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "GN Interior"
+    bl_category = "UltimateMLO"
 
 
 class GN_PT_interior(_PanelBase, Panel):
@@ -5110,6 +7423,7 @@ class GN_PT_setup(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Room Setup"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 0
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5120,7 +7434,8 @@ class GN_PT_setup(_PanelBase, Panel):
 
 class GN_PT_floors(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
-    bl_label = "Floors & Boundaries"
+    bl_label = "Floors & Floor Map"
+    bl_order = 1
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5133,23 +7448,21 @@ class GN_PT_floors(_PanelBase, Panel):
             sub = row.row(align=True)
             sub.enabled = f.top_is_custom
             sub.prop(f, "top", text="Top Z")
-        layout.operator("gn_int.add_floor_sel", text="From Edge", icon='EDGESEL')
-        layout.operator("gn_int.pick_floor_z", text="Slice for Floor Height",
+        layout.operator("gn_int.add_floor_sel", text="Create Floor Map from Edge", icon='EDGESEL')
+        layout.operator("gn_int.pick_floor_z", text="Create Floor Map Slice",
                         icon='EMPTY_SINGLE_ARROW')
-        r2 = layout.row(align=True)
-        r2.prop(s, "new_floor_z")
-        r2.operator("gn_int.add_floor_z", text="Add at Z")
 
         box = layout.box()
-        box.label(text="Boundary cleanup", icon='MOD_BEVEL')
+        box.label(text="Floor Map cleanup", icon='MOD_BEVEL')
         col = box.column(align=True)
         col.prop(s, "detail_tol")
         col.prop(s, "bridge")
         col.prop(s, "wall_margin")
         col.prop(s, "sample_offset")
-        box.label(text="Lock a floor to keep hand-edited boundaries", icon='INFO')
+        box.operator("gn_int.save_floor_map_final", icon='CHECKMARK')
+        box.label(text="Correct the Floor Map in Edit Mode, then save it as", icon='INFO')
+        box.label(text="final -- Generate Floor Map will confirm before overwriting it")
 
-        layout.operator("gn_int.gen_boundaries", icon='MESH_GRID')
         layout.operator("gn_int.seed_rooms", icon='MESH_PLANE')
         layout.operator("gn_int.clear", icon='TRASH')
 
@@ -5157,18 +7470,22 @@ class GN_PT_floors(_PanelBase, Panel):
 class GN_PT_rooms(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Rooms"
+    bl_order = 2
 
     def draw(self, context):
         s = context.scene.gn_int
         layout = self.layout
         layout.prop(s, "partition")
         layout.operator("gn_int.split_edges", icon='MOD_BEVEL')
-        layout.label(text="Edit Mode: pick 2 wall edges, then Split", icon='INFO')
+        layout.label(text="Edit Mode: pick 2 points on the Floor Map, then Split", icon='INFO')
         layout.operator("gn_int.split_room_path", icon='GP_MULTIFRAME_EDITING')
         layout.label(text="Or click a bent path (L-shape) across a room", icon='INFO')
         layout.label(text=f"{len(s.rooms)} room(s)")
+        if len(s.rooms):
+            layout.template_list("GN_UL_rooms", "", s, "rooms", s, "room_index", rows=3)
+            layout.label(text="Lock a room to keep a hand-edited resize", icon='INFO')
+        layout.operator("gn_int.rebuild_rooms", icon='MOD_BUILD')
         row = layout.row(align=True)
-        row.operator("gn_int.rebuild_rooms", icon='FILE_REFRESH')
         row.operator("gn_int.clear_rooms", icon='TRASH')
         layout.operator("gn_int.reunwrap", icon='UV')
 
@@ -5177,6 +7494,7 @@ class GN_PT_stairs(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Stairs"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 6
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5194,6 +7512,7 @@ class GN_PT_openings(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Openings (project)"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 3
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5207,8 +7526,38 @@ class GN_PT_openings(_PanelBase, Panel):
         if len(s.openings):
             layout.label(text=f"{len(s.openings)} opening(s) — X deletes one:")
             layout.prop(s, "opening_filter", expand=True)
-            layout.template_list("GN_UL_openings", "", s, "openings",
-                                 s, "opening_index", rows=4)
+            want = s.opening_filter
+            for (fi, ri), idxs in _group_openings_by_room(context):
+                idxs = [i for i in idxs if want == 'ALL'
+                       or s.openings[i].is_door == (want == 'DOOR')]
+                if not idxs:
+                    continue
+                if fi is None:
+                    label, icon, room_rec = "Unmatched", 'QUESTION', None
+                elif ri is None:
+                    label, icon, room_rec = f"Floor {fi + 1} · unassigned", 'QUESTION', None
+                else:
+                    label, icon, room_rec = f"Floor {fi + 1} · Room {ri + 1}", 'MESH_CUBE', s.rooms[ri]
+                box = layout.box()
+                head = box.row(align=True)
+                if room_rec is not None:
+                    head.prop(room_rec, "openings_expanded", text="", emboss=False,
+                             icon='TRIA_DOWN' if room_rec.openings_expanded else 'TRIA_RIGHT')
+                head.label(text=f"{label}  ({len(idxs)})", icon=icon)
+                if room_rec is not None and not room_rec.openings_expanded:
+                    continue
+                col = box.column(align=True)
+                for i in idxs:
+                    op = s.openings[i]
+                    row = col.row(align=True)
+                    row.active = (i == s.opening_index)
+                    sel = row.operator("gn_int.select_opening", emboss=False,
+                                       text=f"{'Door' if op.is_door else 'Window'}  "
+                                            f"({op.cx:.1f}, {op.cy:.1f})  w{op.hw*2:.2f}",
+                                       icon='MOD_BEVEL' if op.is_door else 'MOD_LATTICE')
+                    sel.index = i
+                    delop = row.operator("gn_int.remove_opening", text="", icon='X')
+                    delop.index = i
         row = layout.row(align=True)
         row.operator("gn_int.remove_opening", text="Delete Selected", icon='X').index = -1
         row.operator("gn_int.clear_openings", text="Clear All", icon='TRASH')
@@ -5219,6 +7568,7 @@ class GN_PT_doors(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Doors"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 4
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5247,30 +7597,90 @@ class GN_PT_windows(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "Windows"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 5
 
     def draw(self, context):
         s = context.scene.gn_int
         layout = self.layout
-        row = layout.row()
-        row.template_list("GN_UL_door_presets", "wins", s, "window_presets",
-                          s, "active_window_preset", rows=2)
-        col = row.column(align=True)
-        col.operator("gn_int.preset_add", text="", icon='ADD').kind = 'WINDOW'
-        col.operator("gn_int.preset_remove", text="", icon='REMOVE').kind = 'WINDOW'
+
+        box1 = layout.box()
+        box1.label(text="1. Project from Exterior", icon='SELECT_DIFFERENCE')
+        box1.label(text="Select exterior window pieces, then Project", icon='INFO')
+        box1.label(text="Openings above -- hole is sized to the best-fitting")
+        box1.label(text="library window, not the exterior piece itself")
+
+        sel_op = (s.openings[s.opening_index]
+                  if 0 <= s.opening_index < len(s.openings) else None)
+        if sel_op is not None and not sel_op.is_door:
+            box1.label(text=f"Selected window ({sel_op.cx:.1f}, {sel_op.cy:.1f}) --",
+                       icon='RESTRICT_SELECT_OFF')
+            box1.label(text="click a library window below to swap it")
+
+        box2 = layout.box()
+        box2.prop(s, "default_window_sill")
         if 0 <= s.active_window_preset < len(s.window_presets):
-            wp = s.window_presets[s.active_window_preset]
-            layout.prop(wp, "width")
-            layout.prop(wp, "height")
-            layout.prop(wp, "sill")
-            layout.prop(wp, "mesh_object")
-        layout.operator("gn_int.opening_edit", text="Window Edit Mode",
-                        icon='GREASEPENCIL').kind = 'WINDOW'
+            active_name = s.window_presets[s.active_window_preset].name
+        else:
+            active_name = "None -- pick one below"
+        box2.label(text=f"Active: {active_name}", icon='CHECKMARK')
+
+        sub = box2.box()
+        sub.label(text="Window Library", icon='ASSET_MANAGER')
+        row = sub.row(align=True)
+        row.operator("gn_int.win_lib_refresh", text="Refresh", icon='FILE_REFRESH')
+        row.operator("gn_int.win_lib_resync_mesh", text="Resync Mesh", icon='IMPORT')
+        if not s.winlib_items:
+            sub.label(text="No entries -- set a Window Library file in", icon='ERROR')
+            sub.label(text="add-on Preferences, then Refresh")
+        else:
+            sub.template_list("GN_UL_window_library", "winlib", s, "winlib_items",
+                              s, "winlib_index", rows=4)
+        sub.label(text="Pick a shape, then place it with Window Edit Mode", icon='INFO')
+        sub.separator()
+        sub.operator("gn_int.lib_register_window", icon='EXPORT')
+        sub.label(text="Selects the active object -- writes to the shared", icon='INFO')
+        sub.label(text="library file (backed up automatically)")
+
+        box2.operator("gn_int.opening_edit", text="Window Placement Mode",
+                      icon='GREASEPENCIL').kind = 'WINDOW'
+        box2.prop(s, "win_edit_mode", toggle=True, icon='ORIENTATION_GIMBAL')
+        if s.win_edit_mode:
+            box2.label(text="Select a window -- drag the arrows to move,", icon='INFO')
+            box2.label(text="the box handle to scale (uniform)")
+
+        box3 = layout.box()
+        box3.label(text="3. Curtains / Blinds", icon='MOD_CLOTH')
+        if 0 <= s.opening_index < len(s.openings):
+            sel = s.openings[s.opening_index]
+            box3.label(text=f"Selected: {'Door' if sel.is_door else 'Window'} "
+                            f"({sel.cx:.1f}, {sel.cy:.1f})",
+                       icon='RESTRICT_SELECT_OFF')
+        else:
+            box3.label(text="No opening selected -- pick one in Openings above", icon='ERROR')
+        if 0 <= s.active_curtain_preset < len(s.curtain_presets):
+            box3.label(text=f"Active: {s.curtain_presets[s.active_curtain_preset].name}",
+                       icon='CHECKMARK')
+        if not s.winlib_items:
+            box3.label(text="No entries -- set a Window Library file in", icon='ERROR')
+            box3.label(text="add-on Preferences, then Refresh")
+        else:
+            box3.template_list("GN_UL_curtain_library", "curtainlib", s, "winlib_items",
+                               s, "winlib_index", rows=3)
+        col2 = box3.column(align=True)
+        col2.prop(s, "curtain_side_overhang")
+        col2.prop(s, "curtain_top_overhang")
+        col2.prop(s, "curtain_bottom_drop")
+        row2 = box3.row(align=True)
+        row2.operator("gn_int.add_curtain", icon='ADD')
+        row2.operator("gn_int.remove_curtain", icon='REMOVE')
+        box3.label(text="Applies to the selected opening above", icon='INFO')
 
 
 class GN_PT_mlo(_PanelBase, Panel):
     bl_parent_id = "GN_PT_interior"
     bl_label = "MLO Setup"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 7
 
     def draw(self, context):
         s = context.scene.gn_int
@@ -5604,11 +8014,13 @@ class GN_PT_material_tools(_PanelBase, Panel):
 # ===========================================================================
 _classes = (
     GN_FloorLevel, GN_Room, GN_Opening, GN_DoorPreset, GN_WindowPreset,
+    GN_WindowLibItem, GN_CurtainPreset, GN_IntPrefs,
     GN_CustomEmptyItem, GN_IntProps,
     GN_CollMatSearchItem, GN_ShellCollMappingItem,
     GN_OT_set_exterior, GN_OT_add_floor_sel,
     GN_OT_add_floor_z, GN_OT_pick_floor_z,
-    GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_clear, GN_OT_clean_interior,
+    GN_OT_remove_floor, GN_OT_gen_boundaries, GN_OT_save_floor_map_final,
+    GN_OT_clear, GN_OT_clean_interior,
     GN_OT_draw_room, GN_OT_add_room, GN_OT_remove_room, GN_OT_rebuild_rooms,
     GN_OT_clear_rooms, GN_OT_seed_rooms, GN_OT_split_room, GN_OT_split_room_path,
     GN_OT_split_edges, GN_OT_create_stairs,
@@ -5620,12 +8032,18 @@ _classes = (
     GN_OT_smart_rename, GN_OT_create_asset,
     GN_OT_cube_unwrap_by_material, GN_OT_scale_uv_by_material,
     GN_OT_split_opening_pieces, GN_OT_project_openings, GN_OT_clear_openings,
-    GN_OT_opening_edit, GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
-    GN_OT_clean_stale_openings,
-    GN_UL_door_presets, GN_UL_openings, GN_UL_floors, GN_UL_shell_coll_mappings,
-    GN_UL_portals,
-    GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms, GN_PT_stairs,
-    GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_mlo, GN_PT_manual_setup,
+    GN_OT_opening_edit, GN_GGT_window_edit,
+    GN_OT_preset_add, GN_OT_preset_remove, GN_OT_remove_opening,
+    GN_OT_select_opening, GN_OT_clean_stale_openings,
+    GN_OT_win_lib_refresh, GN_OT_win_lib_add_to_project, GN_OT_win_lib_remove_from_project,
+    GN_OT_win_lib_resync_mesh, GN_OT_lib_register_window, GN_OT_swap_window,
+    GN_OT_add_curtain, GN_OT_remove_curtain,
+    GN_UL_door_presets, GN_UL_window_library, GN_UL_curtain_library,
+    GN_UL_openings, GN_UL_floors, GN_UL_rooms,
+    GN_UL_shell_coll_mappings, GN_UL_portals,
+    GN_PT_interior, GN_PT_setup, GN_PT_floors, GN_PT_rooms,
+    GN_PT_openings, GN_PT_doors, GN_PT_windows, GN_PT_stairs,
+    GN_PT_mlo, GN_PT_manual_setup,
     GN_PT_add_empties, GN_PT_smart_rename, GN_PT_create_asset,
     GN_PT_material_tools,
 )
@@ -5637,11 +8055,13 @@ _SETTINGS_KEYS = ("wall_margin", "room_height", "sample_offset",
                   "active_floor", "snap", "active_door_preset",
                   "active_window_preset", "add_threshold", "threshold_height",
                   "threshold_depth", "threshold_flip", "threshold_offset",
+                  "active_curtain_preset", "curtain_side_overhang",
+                  "curtain_top_overhang", "curtain_bottom_drop",
                   "mlo_name", "timecycle_name", "timecycle_auto",
                   "build_main", "build_room_colls", "build_prop_colls",
                   "build_asset_colls", "build_shell_collision", "build_portals",
                   "build_empties", "stair_step_height", "stair_step_depth",
-                  "stair_nosing")
+                  "stair_nosing", "default_window_sill")
 
 
 def _dump_scene(scene):
@@ -5658,15 +8078,23 @@ def _dump_scene(scene):
                    "poly_json": r.poly_json, "z_offset": r.z_offset} for r in s.rooms],
         "openings": [{k: getattr(o, k) for k in
                       ("cx", "cy", "nx", "ny", "hw", "sill", "top", "uid",
-                       "is_door", "projected")}
+                       "is_door", "projected", "win_w", "win_h",
+                       "win_allow_curtain", "win_allow_blinds",
+                       "avail_w", "avail_h", "win_key", "win_rotated")}
                      for o in s.openings],
         "door_presets": [{"name": p.name, "width": p.width, "height": p.height,
                           "mesh": p.mesh_object.name if p.mesh_object else ""}
                          for p in s.door_presets],
         "window_presets": [{"name": p.name, "width": p.width, "height": p.height,
-                            "sill": p.sill,
+                            "sill": p.sill, "library_key": p.library_key,
+                            "can_rotate": p.can_rotate, "allow_curtain": p.allow_curtain,
+                            "allow_blinds": p.allow_blinds, "starts_at_floor": p.starts_at_floor,
                             "mesh": p.mesh_object.name if p.mesh_object else ""}
                            for p in s.window_presets],
+        "curtain_presets": [{"name": p.name, "library_key": p.library_key,
+                             "category": p.category,
+                             "mesh": p.mesh_object.name if p.mesh_object else ""}
+                            for p in s.curtain_presets],
     }
     scene["gn_int_backup"] = json.dumps(data)
 
@@ -5725,6 +8153,20 @@ def _restore_scene(scene):
         it.width = p.get("width", 1.0)
         it.height = p.get("height", 1.2)
         it.sill = p.get("sill", 0.9)
+        it.library_key = p.get("library_key", "")
+        it.can_rotate = p.get("can_rotate", False)
+        it.allow_curtain = p.get("allow_curtain", True)
+        it.allow_blinds = p.get("allow_blinds", True)
+        it.starts_at_floor = p.get("starts_at_floor", False)
+        mn = p.get("mesh", "")
+        if mn and mn in bpy.data.objects:
+            it.mesh_object = bpy.data.objects[mn]
+    s.curtain_presets.clear()
+    for p in data.get("curtain_presets", []):
+        it = s.curtain_presets.add()
+        it.name = p.get("name", "Curtain")
+        it.library_key = p.get("library_key", "")
+        it.category = p.get("category", "")
         mn = p.get("mesh", "")
         if mn and mn in bpy.data.objects:
             it.mesh_object = bpy.data.objects[mn]
@@ -5759,16 +8201,62 @@ def _draw_opening_highlight():
         pass
 
 
+def _migrate_floor_map_naming():
+    """One-time rename of the old 'GN_Boundaries' collection (from before the
+    Floor Map rename) to the new name -- in place, so every boundary object
+    and its bound_json data survives untouched, just under the new label."""
+    old = bpy.data.collections.get("GN_Boundaries")
+    if old is not None and bpy.data.collections.get(BOUND_COLL) is None:
+        old.name = BOUND_COLL
+
+
 def _deferred_restore():
     # runs after enable completes (bpy.data is accessible here, unlike register())
+    _migrate_floor_map_naming()
     for scene in bpy.data.scenes:
         try:
             s = scene.gn_int
             if len(s.rooms) == 0 and len(s.floors) == 0 and scene.get("gn_int_backup"):
                 _restore_scene(scene)           # only when a reload wiped the data
         except Exception as e:
-            print("[GN Interior] restore failed:", e)
+            print("[UltimateMLO] restore failed:", e)
     return None                                 # don't repeat
+
+
+def _setup_sync_handlers():
+    """(Re-)establish the depsgraph handler and msgbus subscription that
+    drive list<->viewport selection sync. Both need this re-run on every
+    file load, not just on addon enable: a plain .append() on a handlers
+    list is dropped on file load unless the function itself is decorated
+    @persistent (added below), and empirically the msgbus subscription's
+    own 'PERSISTENT' option was NOT enough to survive switching between
+    .blend files in testing -- so this gets called from a load_post
+    handler too, not just register(), to be robust either way."""
+    if _gn_depsgraph_sync in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_gn_depsgraph_sync)
+    bpy.app.handlers.depsgraph_update_post.append(_gn_depsgraph_sync)
+    bpy.msgbus.clear_by_owner(_GN_MSGBUS_OWNER)
+    bpy.msgbus.subscribe_rna(
+        key=(bpy.types.LayerObjects, "active"),
+        owner=_GN_MSGBUS_OWNER, args=(), notify=_gn_active_object_changed,
+        options={'PERSISTENT'})
+
+
+def _deferred_rescan_lib():
+    """Populate the window-library browse list from disk once, after register
+    or a file load, so the bundled library shows up without a manual Refresh."""
+    try:
+        if hasattr(bpy.context.scene, "gn_int"):
+            rescan_window_library(bpy.context)
+    except Exception:
+        pass
+    return None
+
+
+@bpy.app.handlers.persistent
+def _gn_on_load_post(dummy):
+    _setup_sync_handlers()
+    bpy.app.timers.register(_deferred_rescan_lib, first_interval=0.1)
 
 
 def register():
@@ -5784,13 +8272,23 @@ def register():
         type=GN_ShellCollMappingItem,
         description="Temporary material->collision mapping for Create Shell Collision")
     bpy.app.timers.register(_deferred_restore, first_interval=0.0)
+    bpy.app.timers.register(_deferred_rescan_lib, first_interval=0.1)
     if _HL_HANDLE is None:
         _HL_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
             _draw_opening_highlight, (), 'WINDOW', 'POST_VIEW')
+    _setup_sync_handlers()
+    if _gn_on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_gn_on_load_post)
+    bpy.app.handlers.load_post.append(_gn_on_load_post)
 
 
 def unregister():
     global _HL_HANDLE
+    if _gn_on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_gn_on_load_post)
+    bpy.msgbus.clear_by_owner(_GN_MSGBUS_OWNER)
+    if _gn_depsgraph_sync in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_gn_depsgraph_sync)
     if _HL_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_HL_HANDLE, 'WINDOW')

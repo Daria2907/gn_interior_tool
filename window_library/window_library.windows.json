@@ -1,0 +1,121 @@
+{
+  "windows": [
+    {
+      "key": "window_vert_02",
+      "object_name": "window_plain.001",
+      "name": "window_vert_02",
+      "width": 1.463,
+      "height": 0.837,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_hor_02",
+      "object_name": "window_hor_02",
+      "name": "window_hor_02",
+      "width": 1.589,
+      "height": 0.557,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": true,
+      "allow_curtain": false,
+      "allow_blinds": false,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_hor_03",
+      "object_name": "window_hor_03",
+      "name": "window_hor_03",
+      "width": 0.734,
+      "height": 0.557,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": true,
+      "allow_curtain": false,
+      "allow_blinds": false,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_vert_03",
+      "object_name": "window_vert_03",
+      "name": "window_vert_03",
+      "width": 0.8,
+      "height": 1.859,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": true,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_sq_03",
+      "object_name": "window_sq_03",
+      "name": "window_sq_03",
+      "width": 1.463,
+      "height": 1.4,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_vert_04",
+      "object_name": "window_vert_04",
+      "name": "window_vert_04",
+      "width": 1.669,
+      "height": 2.375,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_hor_04",
+      "object_name": "window_hor_04",
+      "name": "window_hor_04",
+      "width": 1.736,
+      "height": 1.351,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_sq_04",
+      "object_name": "window_sq_04",
+      "name": "window_sq_04",
+      "width": 1.35,
+      "height": 1.351,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    },
+    {
+      "key": "window_vert_05",
+      "object_name": "window_vert_05",
+      "name": "window_vert_05",
+      "width": 0.661,
+      "height": 1.351,
+      "sill": 0.9,
+      "category": "window",
+      "can_rotate": false,
+      "allow_curtain": true,
+      "allow_blinds": true,
+      "starts_at_floor": false
+    }
+  ]
+}
